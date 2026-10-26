@@ -66,6 +66,7 @@ pub enum TrayItem {
     RecordArea,
     TakeScreenshot,
     ImportMedia,
+    GuidedRecording,
     ViewAllRecordings,
     ViewAllScreenshots,
     OpenSettings,
@@ -349,6 +350,10 @@ pub fn build_menu(mode: Mode, previous: &[PreviousItem], version: &str) -> Vec<E
     }
 
     entries.push(Entry::item(tr::tray::import_media(), TrayItem::ImportMedia));
+    entries.push(Entry::item(
+        "Guided Recording...",
+        TrayItem::GuidedRecording,
+    ));
 
     entries.push(Entry::Separator);
     entries.push(mode_submenu(mode));
@@ -428,6 +433,7 @@ pub fn handle_item(item: TrayItem, cx: &mut App) {
         // `TrayItem::ImportVideo` (`src-tauri/src/tray.rs:839-911`): one
         // picker over both media filters, routed by extension.
         TrayItem::ImportMedia => crate::import::pick_and_import_media(cx),
+        TrayItem::GuidedRecording => app_windows::open_guided_recording(cx),
         TrayItem::ViewAllRecordings => {
             app_windows::open_settings(Page::Recordings, cx);
             cx.activate(true);
@@ -617,6 +623,7 @@ fn harness_item(spec: &str, cx: &App) -> Option<TrayItem> {
         "record_window" => TrayItem::RecordWindow,
         "record_area" => TrayItem::RecordArea,
         "import_media" => TrayItem::ImportMedia,
+        "guided_recording" => TrayItem::GuidedRecording,
         "recordings" => TrayItem::ViewAllRecordings,
         "screenshots" => TrayItem::ViewAllScreenshots,
         "settings" => TrayItem::OpenSettings,
@@ -1422,6 +1429,7 @@ mod tests {
                 "Record Area",
                 "Take a Screenshot",
                 "Import Media...",
+                "Guided Recording...",
                 "-",
                 "Select Mode",
                 "Previous",
@@ -1444,13 +1452,14 @@ mod tests {
         let menu = build_menu(Mode::Screenshot, &[], "0.1.0");
         let titles = titles(&menu);
         assert_eq!(
-            &titles[..6],
+            &titles[..7],
             &[
                 "Open Main Window",
                 "Screenshot Display",
                 "Screenshot Window",
                 "Screenshot Area",
                 "Import Media...",
+                "Guided Recording...",
                 "-",
             ]
         );

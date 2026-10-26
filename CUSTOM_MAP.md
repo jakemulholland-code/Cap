@@ -45,6 +45,24 @@ are hints that drift. Read only the region you need from the big files.
   button `"transport-auto-edit"` in `render_transport`; overlays and popover are mounted next to the
   `render_clip_speed_*` calls.
 
+### Guided recording (Claude Motion video + transcript, recorded section by section)
+- Phase 1 (import and split) is built; the section recorder, project assembly and editor hand-off are next.
+- `apps/desktop-gpui/src/guided_recording.rs`: pure logic plus tests. `parse_script` reads the transcript
+  (`# Title`, then `## m:ss Heading` + spoken text; text before the first `##` is ignored). `sample_video`
+  decodes once to 64x36 grey signatures at 10/s; `scene_cuts` finds slide changes (local peaks of change
+  across 3 samples). `plan_sections` keeps written timestamps, fills missing ones by read time
+  (`READ_WORDS_PER_MINUTE` 140), then snaps each start to the strongest cut within 1.5 s (6 s if estimated).
+  `GuidedSession` (saved to `<app data>/guided/<slug>/session.json`), `move_boundary`, `neighbouring_cut`,
+  `prepare_session`. Ignored test `real_video_split` runs on `CAP_GUIDED_VIDEO`/`CAP_GUIDED_SCRIPT` and also
+  saves a session when `CAP_GPUI_APP_DATA_DIR` is set.
+- `apps/desktop-gpui/src/guided_window.rs`: `GuidedRecordingWindow` (pick files, prepare off-thread, section
+  list with start-frame thumbnails, Slide ◀/▶ and ±0.5 s boundary moves, recent sessions).
+- Wiring: `app_windows::open_guided_recording` / `guided_recording_closed` (field `guided`, skipped in
+  `own_windows`), tray item `TrayItem::GuidedRecording` ("Guided Recording...", harness
+  `CAP_GPUI_AUTO_TRAY=guided_recording`), `editor_clips::decode_thumbnail_frame` made `pub(crate)`.
+- Hamilton sample: 18 slide changes found ~0.15 s before each written timestamp (fade midpoints); most
+  sections read longer at 140 wpm than their slide lasts, so phase 2 must let the video hold on its last frame.
+
 ### Paramount Digital template
 - `apps/desktop-gpui/src/editor_template.rs`: pure logic plus tests.
   - Brand constants: Sora/Fraunces, `#1a1a1a`, `#008475`, `[251,251,252]`.

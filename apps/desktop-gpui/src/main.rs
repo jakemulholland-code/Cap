@@ -44,6 +44,8 @@ mod editor_template;
 mod editor_timeline;
 mod editor_window;
 mod feeds;
+mod guided_recording;
+mod guided_window;
 mod hotkeys;
 mod i18n;
 mod import;

@@ -25,6 +25,7 @@ use crate::{
     controls_window::ControlsWindow,
     editor_timeline,
     editor_window::{self, EditorWindow},
+    guided_window::{self, GuidedRecordingWindow},
     main_window::{MainWindow, Mode, TargetType},
     mode_select_window::{self, ModeSelectWindow},
     onboarding_window::{self, OnboardingWindow},
@@ -253,6 +254,7 @@ pub struct AppWindows {
     pub onboarding: Option<WindowHandle<OnboardingWindow>>,
     pub mode_select: Option<WindowHandle<ModeSelectWindow>>,
     pub teleprompter: Option<WindowHandle<TeleprompterWindow>>,
+    pub guided: Option<WindowHandle<GuidedRecordingWindow>>,
     /// One target-select overlay per display, keyed by display so a mode
     /// switch can keep the ones it still wants.
     pub overlays: Vec<(DisplayId, WindowHandle<OverlayWindow>)>,
@@ -547,6 +549,7 @@ pub fn init(main: WindowHandle<MainWindow>, session: Entity<RecordingSession>, c
         onboarding: None,
         mode_select: None,
         teleprompter: None,
+        guided: None,
         overlays: Vec::new(),
         editors: Vec::new(),
         deleting_editors: HashSet::new(),
@@ -744,6 +747,7 @@ pub fn broadcast_theme(cx: &mut App) {
     let onboarding = windows.onboarding;
     let mode_select = windows.mode_select;
     let teleprompter = windows.teleprompter;
+    let guided = windows.guided;
     let controls = windows.controls;
     let camera = windows.camera;
     let overlays: Vec<_> = windows.overlays.iter().map(|(_, handle)| *handle).collect();
@@ -781,6 +785,12 @@ pub fn broadcast_theme(cx: &mut App) {
         });
     }
     if let Some(handle) = teleprompter {
+        let _ = handle.update(cx, |_, window, cx| {
+            refresh(window, cx);
+            cx.notify();
+        });
+    }
+    if let Some(handle) = guided {
         let _ = handle.update(cx, |_, window, cx| {
             refresh(window, cx);
             cx.notify();
@@ -1653,6 +1663,79 @@ pub fn set_recording_mode(mode: Mode, cx: &mut App) {
         .ok();
     // Open overlays label their start button with the mode.
     refresh_target_overlays(cx);
+}
+
+// -- Guided recording ------------------------------------------------------
+
+/// Open (or re-show) the guided recording window.
+pub fn open_guided_recording(cx: &mut App) {
+    if let Some(handle) = cx.global::<AppWindows>().guided {
+        let native = handle
+            .update(cx, |_, window, _| platform::native_window(window))
+            .ok()
+            .flatten();
+        cx.spawn(async move |_| {
+            if let Some(native) = &native {
+                platform::show_native(native);
+            }
+        })
+        .detach();
+        return;
+    }
+
+    let (bounds, display_id) = opening_window_placement(
+        size(
+            px(guided_window::GUIDED_WIDTH),
+            px(guided_window::GUIDED_HEIGHT),
+        ),
+        cx,
+    );
+    let handle = cx.open_window(
+        WindowOptions {
+            #[cfg(target_os = "linux")]
+            app_id: Some(crate::app_windows::APP_ID.into()),
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            display_id,
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("Cap Guided Recording".into()),
+                appears_transparent: true,
+                traffic_light_position: None,
+            }),
+            kind: WindowKind::Normal,
+            focus: true,
+            show: true,
+            is_resizable: true,
+            is_minimizable: true,
+            window_min_size: Some(fitted_window_min_size(
+                size(
+                    px(guided_window::GUIDED_MIN_WIDTH),
+                    px(guided_window::GUIDED_MIN_HEIGHT),
+                ),
+                bounds,
+            )),
+            ..Default::default()
+        },
+        |window, cx| cx.new(|cx| GuidedRecordingWindow::new(window, cx)),
+    );
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::error!("guided recording window failed to open: {error:#}");
+            return;
+        }
+    };
+    cx.global_mut::<AppWindows>().guided = Some(handle);
+    handle
+        .update(cx, |view, window, cx| {
+            platform::kick_display_link(window);
+            view.focus_root(window, cx);
+        })
+        .ok();
+    cx.activate(true);
+}
+
+pub fn guided_recording_closed(cx: &mut App) {
+    cx.global_mut::<AppWindows>().guided.take();
 }
 
 // -- Teleprompter -----------------------------------------------------------
@@ -2809,6 +2892,9 @@ fn own_windows(cx: &mut App) -> Vec<OwnWindowHandle> {
         onboarding,
         mode_select,
         teleprompter,
+        // Guided recording captures camera and mic only, so no exclusion rule
+        // ever needs to find it.
+        guided: _,
         overlays,
         editors,
         deleting_editors: _,

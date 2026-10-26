@@ -2189,7 +2189,7 @@ fn decode_clip_thumbnail(
     decode_thumbnail_frame(&display_path, time.max(0.0))
 }
 
-fn decode_thumbnail_frame(input: &Path, time: f64) -> Result<Arc<RenderImage>, String> {
+pub(crate) fn decode_thumbnail_frame(input: &Path, time: f64) -> Result<Arc<RenderImage>, String> {
     decode_thumbnail_frame_with_budget(
         input,
         time,
