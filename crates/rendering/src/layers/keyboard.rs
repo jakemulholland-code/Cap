@@ -411,11 +411,7 @@ impl KeyboardLayer {
         let font_size = font_size_base * (height as f32 / 1080.0);
         let wrap_width = (width as f32 - margin * 2.0).max(font_size);
 
-        let font_family = match settings.font.as_str() {
-            "System Serif" => Family::Serif,
-            "System Monospace" => Family::Monospace,
-            _ => Family::SansSerif,
-        };
+        let font_family = super::caption_font_family(&settings.font);
 
         let weight = if settings.font_weight >= 700 {
             Weight::BOLD

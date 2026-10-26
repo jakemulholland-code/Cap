@@ -17,6 +17,34 @@ mod text;
 
 use std::sync::OnceLock;
 
+/// Caption and keyboard settings name their font as a plain string, but their
+/// shaped-text caches key on a `Family<'static>`. The names in use are a
+/// handful of installed families, so each is interned once for the process.
+pub(crate) fn caption_font_family(name: &str) -> glyphon::Family<'static> {
+    match name {
+        "System Serif" => glyphon::Family::Serif,
+        "System Monospace" => glyphon::Family::Monospace,
+        "" | "System Sans-Serif" => glyphon::Family::SansSerif,
+        name => {
+            static NAMES: OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+                OnceLock::new();
+            let mut names = NAMES
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let interned = match names.get(name) {
+                Some(interned) => *interned,
+                None => {
+                    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+                    names.insert(leaked);
+                    leaked
+                }
+            };
+            glyphon::Family::Name(interned)
+        }
+    }
+}
+
 /// Building a `glyphon::FontSystem` scans and parses every installed system font,
 /// which costs hundreds of milliseconds to over a second on macOS. cosmic-text
 /// explicitly documents that it should be created once and shared. We previously
