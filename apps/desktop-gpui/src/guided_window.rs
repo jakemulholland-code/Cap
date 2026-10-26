@@ -15,6 +15,8 @@ use crate::guided_recording::{self, BoundarySource, GuidedSection, GuidedSession
 use crate::theme::{LocaleFont as _, Theme};
 use crate::ui::{Button, ButtonSize, ButtonVariant};
 
+mod recorder;
+
 pub const GUIDED_WIDTH: f32 = 900.;
 pub const GUIDED_HEIGHT: f32 = 680.;
 pub const GUIDED_MIN_WIDTH: f32 = 680.;
@@ -32,6 +34,7 @@ enum Stage {
     Choose,
     Preparing,
     Ready,
+    Record,
     Failed(String),
 }
 
@@ -45,6 +48,7 @@ pub struct GuidedRecordingWindow {
     thumbnails: Vec<Option<Arc<RenderImage>>>,
     recent: Vec<(String, PathBuf)>,
     scroll: ScrollHandle,
+    recorder: recorder::Recorder,
 }
 
 impl GuidedRecordingWindow {
@@ -64,6 +68,7 @@ impl GuidedRecordingWindow {
             thumbnails: Vec::new(),
             recent: recent_sessions(),
             scroll: ScrollHandle::new(),
+            recorder: recorder::Recorder::default(),
         }
     }
 
@@ -136,7 +141,7 @@ impl GuidedRecordingWindow {
         .detach();
     }
 
-    fn open_saved(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_saved(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let session = std::fs::read_to_string(&path)
             .map_err(|e| e.to_string())
             .and_then(|json| {
@@ -560,6 +565,14 @@ impl GuidedRecordingWindow {
                     .child(
                         self.button("guided-start-over", "Start over", ButtonVariant::Outline)
                             .on_click(cx.listener(|this, _, _window, cx| this.start_over(cx))),
+                    )
+                    .child(
+                        self.button(
+                            "guided-open-recorder",
+                            "Record sections",
+                            ButtonVariant::Primary,
+                        )
+                        .on_click(cx.listener(|this, _, _window, cx| this.open_recorder(cx))),
                     ),
             )
             .child(
@@ -594,6 +607,7 @@ impl Render for GuidedRecordingWindow {
                 .child("Reading the transcript and finding the slide changes…")
                 .into_any_element(),
             Stage::Ready => self.render_ready(cx).into_any_element(),
+            Stage::Record => self.render_recorder(window, cx),
             Stage::Failed(error) => div()
                 .flex()
                 .flex_col()
@@ -614,6 +628,13 @@ impl Render for GuidedRecordingWindow {
 
         let shell = div()
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if matches!(this.stage, Stage::Record)
+                    && this.recorder_key(event.keystroke.key.as_str(), window, cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
             .size_full()
             .relative()
             .flex()

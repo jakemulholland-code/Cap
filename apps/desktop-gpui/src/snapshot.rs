@@ -37,6 +37,15 @@ pub fn arm_from_env(cx: &mut App) {
                     crate::permission_guide::window_handle(cx)
                 } else if target == "main" {
                     Some(cx.global::<crate::app_windows::AppWindows>().main.into())
+                } else if target == "guided" {
+                    cx.global::<crate::app_windows::AppWindows>()
+                        .guided
+                        .map(Into::into)
+                } else if target == "editor" {
+                    cx.global::<crate::app_windows::AppWindows>()
+                        .editors
+                        .first()
+                        .map(|(_, handle)| (*handle).into())
                 } else {
                     cx.global::<crate::app_windows::AppWindows>()
                         .onboarding

@@ -1251,7 +1251,7 @@ fn frame_timestamp(frame: &ffmpeg::frame::Video, time_base: ffmpeg::Rational) ->
 
 /// The scaler half of the packet loop (`import.rs:1200-1241`), targeting the
 /// encoder's negotiated pixel format instead of a hardcoded YUV420P.
-fn convert_for_encode(
+pub(crate) fn convert_for_encode(
     frame: &ffmpeg::frame::Video,
     scaler: &mut Option<ffmpeg::software::scaling::Context>,
     pixel_format: avformat::Pixel,
@@ -1301,11 +1301,11 @@ const H264_STREAM_TIME_BASE: i32 = 90_000;
 /// `DEFAULT_KEYFRAME_INTERVAL_SECS` (`h264.rs:993`).
 const KEYFRAME_INTERVAL_SECS: u32 = 2;
 
-struct H264Output {
+pub(crate) struct H264Output {
     strict: bool,
     encoder: ffmpeg::codec::encoder::Video,
     stream_index: usize,
-    pixel_format: avformat::Pixel,
+    pub(crate) pixel_format: avformat::Pixel,
     packet: ffmpeg::Packet,
     frame_duration: i64,
     first_pts: Option<i64>,
@@ -1329,7 +1329,7 @@ fn h264_encoder_candidates() -> &'static [&'static str] {
     }
 }
 
-fn open_h264_encoder(
+pub(crate) fn open_h264_encoder(
     output: &mut avformat::context::Output,
     width: u32,
     height: u32,
@@ -1462,7 +1462,7 @@ impl H264Output {
     /// `EncoderBase::update_pts` + `send_frame` (`enc-ffmpeg/src/base.rs:38-115`):
     /// the capture timestamp becomes a first-pts-normalised, strictly
     /// monotonic pts in the encoder's time base.
-    fn queue_frame(
+    pub(crate) fn queue_frame(
         &mut self,
         mut frame: ffmpeg::frame::Video,
         timestamp: Duration,
@@ -1488,7 +1488,7 @@ impl H264Output {
         self.drain_packets(output)
     }
 
-    fn flush(&mut self, output: &mut avformat::context::Output) -> Result<(), String> {
+    pub(crate) fn flush(&mut self, output: &mut avformat::context::Output) -> Result<(), String> {
         self.encoder
             .send_eof()
             .map_err(|e| format!("Failed to flush video: {e}"))?;

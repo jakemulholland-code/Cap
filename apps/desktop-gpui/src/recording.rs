@@ -1661,7 +1661,7 @@ fn blur_mode_json(blur: crate::store::BlurMode) -> &'static str {
     }
 }
 
-fn enable_studio_sound(project_path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn enable_studio_sound(project_path: &std::path::Path) -> std::io::Result<()> {
     let path = project_path.join("project-config.json");
     let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
     let object = config.as_object_mut().ok_or_else(|| {

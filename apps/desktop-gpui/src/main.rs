@@ -44,6 +44,8 @@ mod editor_template;
 mod editor_timeline;
 mod editor_window;
 mod feeds;
+mod guided_build;
+mod guided_media;
 mod guided_recording;
 mod guided_window;
 mod hotkeys;
@@ -769,6 +771,28 @@ fn main() {
             match resolve_auto_editor(&target) {
                 Some(path) => app_windows::open_editor(path, cx),
                 None => tracing::error!(target, "CAP_GPUI_AUTO_EDITOR: no studio .cap to open"),
+            }
+        }
+
+        // `CAP_GPUI_AUTO_GUIDED=<session.json>[,record]`: open a saved guided
+        // session, optionally straight into the section recorder.
+        if let Ok(spec) = std::env::var("CAP_GPUI_AUTO_GUIDED")
+            && !spec.is_empty()
+        {
+            let (path, record) = match spec.strip_suffix(",record") {
+                Some(path) => (path.to_string(), true),
+                None => (spec, false),
+            };
+            app_windows::open_guided_recording(cx);
+            if let Some(handle) = cx.global::<app_windows::AppWindows>().guided {
+                handle
+                    .update(cx, |view, window, cx| {
+                        view.open_saved(path.into(), window, cx);
+                        if record {
+                            view.open_recorder(cx);
+                        }
+                    })
+                    .ok();
             }
         }
 

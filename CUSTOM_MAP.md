@@ -46,22 +46,36 @@ are hints that drift. Read only the region you need from the big files.
   `render_clip_speed_*` calls.
 
 ### Guided recording (Claude Motion video + transcript, recorded section by section)
-- Phase 1 (import and split) is built; the section recorder, project assembly and editor hand-off are next.
+- Flow: tray "Guided Recording..." -> pick video + transcript -> check the split -> "Record sections" ->
+  record a take per section (camera + mic) -> "Build project" -> opens in the editor with Studio Sound on.
 - `apps/desktop-gpui/src/guided_recording.rs`: pure logic plus tests. `parse_script` reads the transcript
   (`# Title`, then `## m:ss Heading` + spoken text; text before the first `##` is ignored). `sample_video`
-  decodes once to 64x36 grey signatures at 10/s; `scene_cuts` finds slide changes (local peaks of change
-  across 3 samples). `plan_sections` keeps written timestamps, fills missing ones by read time
-  (`READ_WORDS_PER_MINUTE` 140), then snaps each start to the strongest cut within 1.5 s (6 s if estimated).
-  `GuidedSession` (saved to `<app data>/guided/<slug>/session.json`), `move_boundary`, `neighbouring_cut`,
-  `prepare_session`. Ignored test `real_video_split` runs on `CAP_GUIDED_VIDEO`/`CAP_GUIDED_SCRIPT` and also
-  saves a session when `CAP_GPUI_APP_DATA_DIR` is set.
-- `apps/desktop-gpui/src/guided_window.rs`: `GuidedRecordingWindow` (pick files, prepare off-thread, section
-  list with start-frame thumbnails, Slide ◀/▶ and ±0.5 s boundary moves, recent sessions).
+  decodes once to 64x36 grey signatures at 10/s (`VideoSamples`); `scene_cuts` finds slide changes (peaks of
+  change across 3 samples, refined to the first sample showing the new slide). `plan_sections` keeps written
+  timestamps, fills missing ones by read time (`READ_WORDS_PER_MINUTE` 140), then snaps each start to the
+  strongest cut within 1.5 s (6 s if estimated). `GuidedSession` (saved to `<app data>/guided/<slug>/session.json`,
+  takes in `takes/section-NN-take-N.cap`), `move_boundary`, `neighbouring_cut`, `add_take`, `ready_to_build`.
+  `Take` (`lead_secs` = recording start to slide start, `duration`), `GuidedSection::chosen_take` (newest unless
+  picked). `SegmentPlan` (lead hold, slide, last-frame hold; `source_time`). `prepare_session`.
+- `apps/desktop-gpui/src/guided_media.rs`: `VideoReader` (decode from a time, convert/scale), `Player` (thread
+  playing pictures at wall-clock pace, optional rodio sound; holds a picture after its `until`),
+  `write_segment_display` (H.264 via `import::open_h264_encoder`), `write_segment_audio` (16-bit WAV),
+  `mix`. Ignored test `real_segment_render`.
+- `apps/desktop-gpui/src/guided_build.rs`: `build_project` writes `<recordings>/<title>.cap`: segment N =
+  rendered slide `display.mp4` (start_time = camera start), copied take camera + mic (their own start_times),
+  `system_audio.wav`; timeline clip N = [lead, lead + take]; config copied from the first take, then
+  `recording::enable_studio_sound`. `take_media` for review. Ignored test `real_build_from_fake_takes`.
+- `apps/desktop-gpui/src/guided_window.rs`: `GuidedRecordingWindow` (stages Choose/Preparing/Ready/Record),
+  split list with thumbnails and boundary moves, recent sessions.
+- `apps/desktop-gpui/src/guided_window/recorder.rs`: `Recorder`/`Phase`. Takes are `recording::start` with
+  `ScreenCaptureTarget::CameraOnly` + the main window's camera/mic from `Feeds`, stopped with
+  `ActiveRecording::stop`, cancelled with `cancel_and_delete`. 3 s countdown, then the slide plays and the
+  script scrolls at the wpm setting. Keys: Space record/stop, Esc cancel, arrows change section.
 - Wiring: `app_windows::open_guided_recording` / `guided_recording_closed` (field `guided`, skipped in
-  `own_windows`), tray item `TrayItem::GuidedRecording` ("Guided Recording...", harness
-  `CAP_GPUI_AUTO_TRAY=guided_recording`), `editor_clips::decode_thumbnail_frame` made `pub(crate)`.
-- Hamilton sample: 18 slide changes found ~0.15 s before each written timestamp (fade midpoints); most
-  sections read longer at 140 wpm than their slide lasts, so phase 2 must let the video hold on its last frame.
+  `own_windows`), `TrayItem::GuidedRecording`, `editor_clips::decode_thumbnail_frame` and import's H.264 helpers
+  are `pub(crate)`. Harness: `CAP_GPUI_AUTO_TRAY=guided_recording`, `CAP_GPUI_AUTO_GUIDED=<session.json>[,record]`,
+  snapshot targets `guided` / `editor` (snapshots work on macOS only).
+- Hamilton sample: slide changes land on whole seconds; most sections read longer at 140 wpm than their slide.
 
 ### Paramount Digital template
 - `apps/desktop-gpui/src/editor_template.rs`: pure logic plus tests.

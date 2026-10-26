@@ -51,9 +51,67 @@ pub struct GuidedSection {
     pub start: f64,
     pub end: f64,
     pub source: BoundarySource,
+    #[serde(default)]
+    pub takes: Vec<Take>,
+    /// The take the project is built from; the newest when unset.
+    #[serde(default)]
+    pub chosen: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Take {
+    pub project_path: PathBuf,
+    /// Seconds from the recording starting to the slide starting to play.
+    pub lead_secs: f64,
+    /// Seconds from the slide starting to the take being stopped.
+    pub duration: f64,
+}
+
+/// Where one section's take sits in its built segment. Segment time 0 is the
+/// camera's first frame; the slide starts at `lead`, plays to its end and then
+/// holds its last frame until the take ends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SegmentPlan {
+    pub lead: f64,
+    pub length: f64,
+    pub source_start: f64,
+    pub source_end: f64,
+}
+
+impl SegmentPlan {
+    pub fn new(section: &GuidedSection, take: &Take, camera_start: f64) -> Self {
+        Self {
+            lead: (take.lead_secs - camera_start).max(0.0),
+            length: take.duration.max(0.0),
+            source_start: section.start,
+            source_end: section.end,
+        }
+    }
+
+    pub fn total(&self) -> f64 {
+        self.lead + self.length
+    }
+
+    /// The source video time shown at segment time `t`.
+    pub fn source_time(&self, t: f64) -> f64 {
+        (self.source_start + (t - self.lead).max(0.0)).min(self.source_end)
+    }
 }
 
 impl GuidedSection {
+    pub fn chosen_take(&self) -> Option<&Take> {
+        self.chosen
+            .and_then(|index| self.takes.get(index))
+            .or(self.takes.last())
+    }
+
+    pub fn chosen_index(&self) -> Option<usize> {
+        self.chosen
+            .filter(|index| *index < self.takes.len())
+            .or_else(|| self.takes.len().checked_sub(1))
+    }
+
     pub fn duration(&self) -> f64 {
         self.end - self.start
     }
@@ -82,6 +140,39 @@ pub struct GuidedSession {
 impl GuidedSession {
     pub fn directory(&self) -> PathBuf {
         sessions_dir().join(slug(&self.title))
+    }
+
+    pub fn takes_dir(&self) -> PathBuf {
+        self.directory().join("takes")
+    }
+
+    /// Where the next take of section `index` is kept.
+    pub fn next_take_path(&self, index: usize) -> PathBuf {
+        let number = self
+            .sections
+            .get(index)
+            .map_or(0, |section| section.takes.len())
+            + 1;
+        self.takes_dir()
+            .join(format!("section-{:02}-take-{number}.cap", index + 1))
+    }
+
+    pub fn add_take(&mut self, index: usize, take: Take) {
+        if let Some(section) = self.sections.get_mut(index) {
+            section.takes.push(take);
+            section.chosen = Some(section.takes.len() - 1);
+        }
+    }
+
+    pub fn recorded_count(&self) -> usize {
+        self.sections
+            .iter()
+            .filter(|section| section.chosen_take().is_some())
+            .count()
+    }
+
+    pub fn ready_to_build(&self) -> bool {
+        !self.sections.is_empty() && self.recorded_count() == self.sections.len()
     }
 
     pub fn save(&self) -> Result<PathBuf, String> {
@@ -254,40 +345,59 @@ pub fn scene_cuts(times: &[f64], signatures: &[Vec<u8>]) -> Vec<SceneCut> {
     if count <= SCORE_SPAN {
         return Vec::new();
     }
-    let scores: Vec<(f64, f32)> = (SCORE_SPAN..count)
+    let scores: Vec<(usize, f32)> = (SCORE_SPAN..count)
         .map(|index| {
-            let before = &signatures[index - SCORE_SPAN];
-            let after = &signatures[index];
-            let len = before.len().min(after.len()).max(1);
-            let total: u64 = before
-                .iter()
-                .zip(after)
-                .map(|(a, b)| u64::from(a.abs_diff(*b)))
-                .sum();
-            let midpoint = (times[index - SCORE_SPAN] + times[index]) / 2.0;
-            (midpoint, total as f32 / len as f32)
+            (
+                index,
+                difference(&signatures[index - SCORE_SPAN], &signatures[index]),
+            )
         })
         .collect();
 
     let mut cuts: Vec<SceneCut> = Vec::new();
-    for &(time, score) in &scores {
+    for (position, &(index, score)) in scores.iter().enumerate() {
         if score < MIN_CUT_SCORE {
             continue;
         }
+        let time = times[index];
         let peak = scores
             .iter()
-            .filter(|(other_time, _)| (other_time - time).abs() <= CUT_SUPPRESS_SECS)
-            .all(|&(other_time, other)| other < score || (other == score && other_time >= time));
-        if !peak
-            || cuts
-                .last()
-                .is_some_and(|last| time - last.time <= CUT_SUPPRESS_SECS)
+            .enumerate()
+            .filter(|(_, (other, _))| (times[*other] - time).abs() <= CUT_SUPPRESS_SECS)
+            .all(|(other_position, &(_, other))| {
+                other < score || (other == score && other_position >= position)
+            });
+        if !peak {
+            continue;
+        }
+        // The window spans several samples; the slide starts at the first
+        // sample after the biggest single-step change inside it.
+        let first = (index + 1 - SCORE_SPAN..=index)
+            .max_by(|a, b| {
+                difference(&signatures[a - 1], &signatures[*a])
+                    .total_cmp(&difference(&signatures[b - 1], &signatures[*b]))
+            })
+            .unwrap_or(index);
+        let time = times[first];
+        if cuts
+            .last()
+            .is_some_and(|last| time - last.time <= CUT_SUPPRESS_SECS)
         {
             continue;
         }
         cuts.push(SceneCut { time, score });
     }
     cuts
+}
+
+fn difference(before: &[u8], after: &[u8]) -> f32 {
+    let len = before.len().min(after.len()).max(1);
+    let total: u64 = before
+        .iter()
+        .zip(after)
+        .map(|(a, b)| u64::from(a.abs_diff(*b)))
+        .sum();
+    total as f32 / len as f32
 }
 
 /// Turns the script into sections over the video. Written timestamps are
@@ -348,6 +458,8 @@ pub fn plan_sections(
             start: start.min(video_duration),
             end: end.min(video_duration),
             source,
+            takes: Vec::new(),
+            chosen: None,
         });
     }
     sections
@@ -666,7 +778,7 @@ Impressions fell 33% year on year.
         }
         let cuts = scene_cuts(&times, &signatures);
         assert_eq!(cuts.len(), 1);
-        assert!((cuts[0].time - 3.0).abs() <= 0.2, "{cuts:?}");
+        assert_eq!(cuts[0].time, 3.0, "{cuts:?}");
     }
 
     #[test]
@@ -696,6 +808,67 @@ Impressions fell 33% year on year.
         session.move_boundary(2, 40.0);
         assert_eq!(session.sections[2].start, 29.0);
         assert_eq!(session.sections[2].source, BoundarySource::Manual);
+    }
+
+    #[test]
+    fn takes_choose_the_newest_unless_picked() {
+        let mut session = GuidedSession {
+            title: "Demo".into(),
+            video_path: PathBuf::new(),
+            script_path: PathBuf::new(),
+            video_duration: 20.0,
+            sections: plan_sections(
+                &[section("A", Some(0.0), 5), section("B", Some(10.0), 5)],
+                20.0,
+                &[],
+            ),
+            cuts: Vec::new(),
+        };
+        assert!(!session.ready_to_build());
+        assert!(session.next_take_path(1).ends_with("section-02-take-1.cap"));
+        let take = |duration| Take {
+            project_path: PathBuf::from("t"),
+            lead_secs: 3.2,
+            duration,
+        };
+        session.add_take(0, take(9.0));
+        session.add_take(0, take(11.0));
+        assert_eq!(session.sections[0].chosen_take().unwrap().duration, 11.0);
+        session.sections[0].chosen = Some(0);
+        assert_eq!(session.sections[0].chosen_index(), Some(0));
+        assert_eq!(session.recorded_count(), 1);
+        session.add_take(1, take(4.0));
+        assert!(session.ready_to_build());
+        assert!(session.next_take_path(0).ends_with("section-01-take-3.cap"));
+    }
+
+    #[test]
+    fn segment_plan_holds_the_slide() {
+        let sections = plan_sections(
+            &[section("A", Some(0.0), 5), section("B", Some(10.0), 5)],
+            20.0,
+            &[],
+        );
+        let take = Take {
+            project_path: PathBuf::new(),
+            lead_secs: 3.5,
+            duration: 14.0,
+        };
+        let plan = SegmentPlan::new(&sections[1], &take, 0.5);
+        assert_eq!(plan.lead, 3.0);
+        assert_eq!(plan.total(), 17.0);
+        assert_eq!(plan.source_time(1.0), 10.0);
+        assert_eq!(plan.source_time(5.0), 12.0);
+        assert_eq!(plan.source_time(16.0), 20.0);
+    }
+
+    #[test]
+    fn sessions_without_takes_still_load() {
+        let json = r#"{"title":"t","videoPath":"v","scriptPath":"s","videoDuration":10.0,
+            "sections":[{"title":"A","text":"x","start":0.0,"end":10.0,"source":"start"}]}"#;
+        let session: GuidedSession = serde_json::from_str(json).unwrap();
+        assert!(session.sections[0].takes.is_empty());
+        assert_eq!(session.sections[0].chosen_take(), None);
     }
 
     #[test]
