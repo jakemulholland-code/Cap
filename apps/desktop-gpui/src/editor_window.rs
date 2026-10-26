@@ -78,6 +78,7 @@ use crate::{
     ui,
 };
 
+mod auto_edit;
 mod frame;
 mod loading;
 mod scenes;
@@ -1461,6 +1462,10 @@ pub struct EditorWindow {
     pub(crate) generating_keyboard: bool,
     pub(crate) keyboard_generation_message: Option<String>,
     clip_speed: Option<ClipSpeedMenu>,
+    auto_edit: Option<auto_edit::AutoEditPanel>,
+    auto_edit_settings: crate::editor_auto_edit::AutoEditSettings,
+    auto_edit_activity: Option<Arc<Vec<Vec<f64>>>>,
+    loading_auto_edit_activity: bool,
     timeline_scroll: gpui::ScrollHandle,
     minimap_drag: Option<timeline::MinimapDrag>,
     /// Magnetic edges for the live drag: playhead, clip cuts and every other
@@ -2104,6 +2109,10 @@ impl EditorWindow {
             generating_keyboard: false,
             keyboard_generation_message: None,
             clip_speed: None,
+            auto_edit: None,
+            auto_edit_settings: Default::default(),
+            auto_edit_activity: None,
+            loading_auto_edit_activity: false,
             timeline_scroll: gpui::ScrollHandle::new(),
             minimap_drag: None,
             drag_snap_targets: snap::SnapTargets::default(),
@@ -2305,6 +2314,7 @@ impl EditorWindow {
                 self.apply_seek(end);
             }
         }
+        self.refresh_auto_edit_preview();
     }
 
     /// The transient popovers a project change closes, shared by the full
@@ -2327,6 +2337,7 @@ impl EditorWindow {
     ) {
         self.timeline.mic_waveforms = mic;
         self.timeline.system_waveforms = system;
+        self.refresh_auto_edit_preview();
         cx.notify();
         window.refresh();
     }
@@ -3596,6 +3607,12 @@ impl EditorWindow {
         }
         if self.clip_speed.is_some() && event.keystroke.key.as_str() == "escape" {
             self.clip_speed = None;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.auto_edit.is_some() && event.keystroke.key.as_str() == "escape" {
+            self.auto_edit = None;
             cx.stop_propagation();
             cx.notify();
             return;
@@ -10544,6 +10561,37 @@ impl EditorWindow {
                                 )),
                             ),
                     )
+                    .child(
+                        div()
+                            .id("transport-auto-edit-tooltip")
+                            .tooltip_show_delay(crate::ui::TOOLTIP_SHOW_DELAY)
+                            .tooltip(move |_, cx| {
+                                ui::Tooltip::new(&theme, "Preview and cut silent, idle sections")
+                                    .view(cx)
+                            })
+                            .child(
+                                ui::Button::plain(
+                                    &theme,
+                                    "transport-auto-edit",
+                                    if self.auto_edit.is_some() {
+                                        ui::ButtonVariant::Primary
+                                    } else {
+                                        ui::ButtonVariant::Gray
+                                    },
+                                    ui::ButtonSize::Sm,
+                                )
+                                .icon("icons/sparkles.svg")
+                                .label("Auto edit")
+                                .radius(px(7.))
+                                .disabled(!self.project_ready())
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.toggle_auto_edit(window, cx);
+                                        window.refresh();
+                                    },
+                                )),
+                            ),
+                    )
                     .child(self.header_divider())
                     // `IconCapZoomOut` -> `updateZoom(zoom * 1.1,
                     // playbackTime)`; `IconCapZoomIn` -> `zoom / 1.1`
@@ -11114,6 +11162,11 @@ impl EditorWindow {
                     // The empty zoom track's generate prompt
                     // (`TL/ZoomTrack.tsx:297-336`): a centered button plus a
                     // session-dismiss X, shown while cursor data exists.
+                    .children(
+                        (kind == TrackKind::Clip)
+                            .then(|| self.render_auto_edit_overlays(model, viewport_width))
+                            .flatten(),
+                    )
                     .children(
                         (kind == TrackKind::Clip)
                             .then(|| self.render_clip_speed_overlays(model, viewport_width, cx)),
@@ -12048,6 +12101,7 @@ impl Render for EditorWindow {
             .children(self.render_frame_controls(window, cx))
             .children(self.render_add_track_popover(cx))
             .children(self.render_clip_speed_popover(cx))
+            .children(self.render_auto_edit_popover(cx))
             // The config sidebar's sliders take the same layer, for the same
             // reason -- and its release is what closes the undo bracket, so a
             // drag that ends outside the 32px row still records exactly one

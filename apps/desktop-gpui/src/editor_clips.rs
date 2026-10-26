@@ -244,6 +244,59 @@ pub(crate) fn drop_clip_transition(
     true
 }
 
+/// The inverse of [`drop_clip_transition`]: puts a transition on
+/// `segment_index`'s leading boundary and ripples every other track past it
+/// back by the overlap the transition takes. Returns false when the boundary
+/// already has one or the clips are too short to overlap.
+pub(crate) fn add_clip_transition(
+    timeline: &mut TimelineConfiguration,
+    segment_index: usize,
+    kind: cap_project::ClipTransitionType,
+    duration: f64,
+) -> bool {
+    if segment_index == 0
+        || segment_index >= timeline.segments.len()
+        || timeline.effective_transition(segment_index).is_some()
+    {
+        return false;
+    }
+    let boundary = clip_timeline_offsets(timeline)
+        .get(segment_index)
+        .copied()
+        .unwrap_or(0.);
+    let boundary = edits::effective_to_output(&timeline.hold_windows(), boundary);
+    timeline
+        .transitions
+        .retain(|candidate| candidate.segment_index as usize != segment_index);
+    let position = timeline
+        .transitions
+        .partition_point(|candidate| (candidate.segment_index as usize) < segment_index);
+    timeline.transitions.insert(
+        position,
+        ClipTransition {
+            segment_index: segment_index as u32,
+            kind,
+            duration,
+        },
+    );
+    let Some(effective) = timeline.effective_transition(segment_index) else {
+        timeline.transitions.remove(position);
+        return false;
+    };
+    let shift = -effective.duration;
+    ripple_track(&mut timeline.style_segments, boundary, shift);
+    ripple_track(&mut timeline.image_segments, boundary, shift);
+    ripple_track(&mut timeline.zoom_segments, boundary, shift);
+    ripple_track(&mut timeline.scene_segments, boundary, shift);
+    ripple_track(&mut timeline.mask_segments, boundary, shift);
+    ripple_track(&mut timeline.text_segments, boundary, shift);
+    ripple_track(&mut timeline.caption_segments, boundary, shift);
+    ripple_track(&mut timeline.camera3d_segments, boundary, shift);
+    ripple_keyboard_track(&mut timeline.keyboard_segments, boundary, shift);
+    ripple_track(&mut timeline.audio_segments, boundary, shift);
+    true
+}
+
 /// `moveClip` (`ClipsSidebar.tsx:639-690`): reorder `timeline.segments`,
 /// remapping the transitions that survive and -- for each one that does not --
 /// rippling every other track across the boundary the removed overlap used to
