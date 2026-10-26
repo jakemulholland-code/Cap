@@ -82,6 +82,7 @@ mod frame;
 mod loading;
 mod scenes;
 mod snap;
+mod template;
 
 // ---------------------------------------------------------------------------
 // Window geometry
@@ -9806,6 +9807,20 @@ impl EditorWindow {
                                 this.open_presets_menu(bounds.bottom_left(), window, cx);
                             })),
                     )
+                    .child(
+                        ui::EditorButton::plain(&theme, "paramount-template")
+                            .left_icon("icons/palette.svg")
+                            .when(!compact, |button| button.label("Template"))
+                            .tooltip(
+                                &theme,
+                                "Apply the Paramount Digital template: intro, section cards, outro, logo and brand styling",
+                            )
+                            .disabled(!self.project_ready())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_paramount_template(window, cx);
+                                window.refresh();
+                            })),
+                    )
                     .child(self.render_clips_pill(compact, cx))
                     // `<Show when={hasTranscript()}>`: the button only exists
                     // once a transcript with words does.
@@ -10539,6 +10554,33 @@ impl EditorWindow {
                                 .on_click(cx.listener(
                                     |this, _, window, cx| {
                                         this.toggle_split_mode(cx);
+                                        window.refresh();
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("transport-add-section-tooltip")
+                            .tooltip_show_delay(crate::ui::TOOLTIP_SHOW_DELAY)
+                            .tooltip(move |_, cx| {
+                                ui::Tooltip::new(&theme, "Add a branded section card at the playhead")
+                                    .view(cx)
+                            })
+                            .child(
+                                ui::Button::plain(
+                                    &theme,
+                                    "transport-add-section",
+                                    ui::ButtonVariant::Gray,
+                                    ui::ButtonSize::Sm,
+                                )
+                                .icon("icons/type.svg")
+                                .label("Add section")
+                                .radius(px(7.))
+                                .disabled(!self.project_ready())
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.add_section_at_playhead(window, cx);
                                         window.refresh();
                                     },
                                 )),
