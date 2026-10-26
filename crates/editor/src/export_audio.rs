@@ -498,9 +498,12 @@ impl ExportAudioSources {
                     track.enhanced = None;
                     continue;
                 }
-                if track.isolation != project.audio.isolation {
+                if track.isolation != project.audio.isolation
+                    || track.voice_model != project.audio.voice_model
+                {
                     track.enhancer = None;
                     track.isolation = project.audio.isolation;
+                    track.voice_model = project.audio.voice_model;
                 }
                 let profile = *track.voice_profile.get_or_insert_with(|| {
                     AudioData::from_file_range(&track.path, 0, VOICE_PROFILE_SAMPLES)
@@ -516,6 +519,7 @@ impl ExportAudioSources {
                         project.audio.isolation.strength(),
                         profile,
                     )
+                    .with_denoiser(crate::audio::voice_denoiser(project.audio.voice_model))
                 });
                 let range = enhancer.source_range(start, end.saturating_sub(start));
                 track.prepare(
@@ -604,6 +608,7 @@ struct ExportAudioTrack {
     enhanced: Option<VoiceAudio>,
     voice_profile: Option<VoiceProfile>,
     isolation: cap_project::VoiceIsolation,
+    voice_model: cap_project::VoiceModel,
 }
 
 impl ExportAudioTrack {
@@ -635,6 +640,7 @@ impl ExportAudioTrack {
             enhanced: None,
             voice_profile: None,
             isolation: cap_project::VoiceIsolation::default(),
+            voice_model: cap_project::VoiceModel::default(),
         })
     }
 

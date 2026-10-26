@@ -1,14 +1,14 @@
 use crate::export_audio::{EXPORT_AUDIO_BLOCK_SAMPLES, ExportAudioError, ExportAudioSources};
 use cap_audio::{
     AudioData, AudioRendererTrack, DecodedAudio, FromSampleBytes, StereoMode, VoiceAudio,
-    VoiceEnhancer, VoiceSource, cast_bytes_to_f32_slice, cast_f32_slice_to_bytes,
+    VoiceDenoiser, VoiceEnhancer, VoiceSource, cast_bytes_to_f32_slice, cast_f32_slice_to_bytes,
     high_quality_resampler_options,
 };
 use cap_media::MediaError;
 use cap_media_info::AudioInfo;
 use cap_project::{
     AudioConfiguration, ClipOffsets, ClipSpeedAudioMode, ClipTransitionType, ProjectConfiguration,
-    TimelineConfiguration, TimelineFrameMapping, TimelineSource, VoiceIsolation,
+    TimelineConfiguration, TimelineFrameMapping, TimelineSource, VoiceIsolation, VoiceModel,
 };
 use ffmpeg::{
     ChannelLayout, filter, format as avformat, frame::Audio as FFAudio, software::resampling,
@@ -154,6 +154,7 @@ struct SpeedAudioProcessorKey {
     mic_volume_bits: u32,
     improve_microphone: bool,
     isolation: VoiceIsolation,
+    voice_model: VoiceModel,
     system_volume_bits: u32,
     mic_stereo_mode: u8,
     mic_offset_bits: u32,
@@ -752,6 +753,7 @@ impl AudioRenderer {
             mic_volume_bits: project.audio.mic_volume_db.to_bits(),
             improve_microphone: project.audio.improve,
             isolation: project.audio.isolation,
+            voice_model: project.audio.voice_model,
             system_volume_bits: project.audio.system_volume_db.to_bits(),
             mic_stereo_mode: project_stereo_mode_key(&project.audio.mic_stereo_mode),
             mic_offset_bits: offsets.mic.to_bits(),
@@ -949,7 +951,7 @@ fn render_audio_data_chunk(
                     data.data,
                     start,
                     end.saturating_sub(start),
-                    project.audio.isolation,
+                    &project.audio,
                 ))
             })
             .collect::<Vec<_>>();
@@ -983,7 +985,15 @@ fn render_audio_data_chunk(
 
 #[derive(Default)]
 struct VoiceEnhancementCache {
-    slots: Vec<((usize, usize, VoiceIsolation), VoiceEnhancer)>,
+    slots: Vec<((usize, usize, VoiceIsolation, VoiceModel), VoiceEnhancer)>,
+}
+
+/// The noise remover `cap_audio` runs for a project's Studio Sound model.
+pub(crate) fn voice_denoiser(model: VoiceModel) -> VoiceDenoiser {
+    match model {
+        VoiceModel::DeepFilterNet => VoiceDenoiser::DeepFilterNet,
+        VoiceModel::RnNoise => VoiceDenoiser::RnNoise,
+    }
 }
 
 impl VoiceEnhancementCache {
@@ -993,9 +1003,9 @@ impl VoiceEnhancementCache {
         source: &DecodedAudio,
         start: usize,
         count: usize,
-        isolation: VoiceIsolation,
+        audio: &AudioConfiguration,
     ) -> VoiceAudio {
-        let key = (key.0, key.1, isolation);
+        let key = (key.0, key.1, audio.isolation, audio.voice_model);
         let index = self
             .slots
             .iter()
@@ -1007,9 +1017,10 @@ impl VoiceEnhancementCache {
                 key,
                 VoiceEnhancer::with_settings(
                     source.channels(),
-                    isolation.strength(),
+                    audio.isolation.strength(),
                     source.voice_profile(),
-                ),
+                )
+                .with_denoiser(voice_denoiser(audio.voice_model)),
             )
         };
         if self.slots.len() == 4 {

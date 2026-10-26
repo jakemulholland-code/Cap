@@ -1,6 +1,6 @@
 use cap_audio::{
-    AudioData, AudioSampleSource, AudioStream, ChunkRead, VOICE_PROFILE_SAMPLES, VoiceEnhancer,
-    VoiceProfile, cast_f32_slice_to_bytes,
+    AudioData, AudioSampleSource, AudioStream, ChunkRead, VOICE_PROFILE_SAMPLES, VoiceDenoiser,
+    VoiceEnhancer, VoiceProfile, cast_f32_slice_to_bytes,
 };
 use std::{
     error::Error,
@@ -54,7 +54,7 @@ fn decode_original(path: &Path) -> Result<(), Box<dyn Error>> {
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args_os().skip(1);
     let path = args.next().map(PathBuf::from).ok_or_else(|| {
-        io::Error::other("Usage: studio-sound-probe INPUT [off|light|balanced|strong]; writes f32 PCM at 48 kHz to stdout")
+        io::Error::other("Usage: studio-sound-probe INPUT [off|light|balanced|strong] [rnnoise|deepfilternet]; writes f32 PCM at 48 kHz to stdout")
     })?;
     ffmpeg::init()?;
     ffmpeg::log::set_level(ffmpeg::log::Level::Error);
@@ -65,6 +65,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("strong") => 0.98,
         Some(value) => return Err(io::Error::other(format!("Unknown isolation: {value}")).into()),
     };
+    let denoiser = match args.next().as_deref().and_then(|value| value.to_str()) {
+        None | Some("rnnoise") => VoiceDenoiser::RnNoise,
+        Some("deepfilternet") => VoiceDenoiser::DeepFilterNet,
+        Some(value) => return Err(io::Error::other(format!("Unknown denoiser: {value}")).into()),
+    };
     let started = Instant::now();
     let seed =
         AudioData::from_file_range(&path, 0, VOICE_PROFILE_SAMPLES).map_err(io::Error::other)?;
@@ -72,7 +77,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let channels = seed.channels();
     drop(seed);
     let calibration_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let mut enhancer = VoiceEnhancer::with_settings(channels, strength, profile);
+    let mut enhancer =
+        VoiceEnhancer::with_settings(channels, strength, profile).with_denoiser(denoiser);
     let mut stream = AudioStream::open(&path, Arc::new(AtomicBool::new(false)))?;
     let mut window = Window {
         samples: Vec::new(),

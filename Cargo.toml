@@ -109,6 +109,37 @@ opt-level = 2
 [profile.dev.package.cap-audio]
 opt-level = 2
 
+# DeepFilterNet (Studio Sound) runs per audio frame; unoptimized it cannot keep up.
+[profile.dev.package.deep_filter]
+opt-level = 2
+
+[profile.dev.package.tract-core]
+opt-level = 2
+
+[profile.dev.package.tract-linalg]
+opt-level = 2
+
+[profile.dev.package.tract-data]
+opt-level = 2
+
+[profile.dev.package.tract-hir]
+opt-level = 2
+
+[profile.dev.package.tract-onnx]
+opt-level = 2
+
+[profile.dev.package.tract-onnx-opl]
+opt-level = 2
+
+[profile.dev.package.tract-nnef]
+opt-level = 2
+
+[profile.dev.package.tract-pulse]
+opt-level = 2
+
+[profile.dev.package.tract-pulse-opl]
+opt-level = 2
+
 # opt-level 0 compiles the AVX2 BT.709 kernel into a spill loop. On the
 # ci-verify profile that is 180 ms for 1080p against 3 ms for swscale, and
 # the Windows real-capture job then keeps about 6 fps. opt-level 1 is under

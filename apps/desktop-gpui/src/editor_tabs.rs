@@ -1893,6 +1893,41 @@ impl EditorWindow {
                     .child(
                         ui::SegmentedControl::editor(
                             &theme,
+                            "voice-model",
+                            [
+                                ("AI (DeepFilterNet)", cap_project::VoiceModel::DeepFilterNet),
+                                ("Classic", cap_project::VoiceModel::RnNoise),
+                            ]
+                            .iter()
+                            .map(|(label, model)| {
+                                ui::SegmentOption::new(
+                                    *label,
+                                    self.project.audio.voice_model == *model,
+                                )
+                            })
+                            .collect(),
+                        )
+                        .stretch()
+                        .on_select(cx.listener(
+                            move |this, index: &usize, window, cx| {
+                                let model = if *index == 0 {
+                                    cap_project::VoiceModel::DeepFilterNet
+                                } else {
+                                    cap_project::VoiceModel::RnNoise
+                                };
+                                this.edit_project("voice-model", window, cx, move |project| {
+                                    if project.audio.voice_model == model {
+                                        return false;
+                                    }
+                                    project.audio.voice_model = model;
+                                    true
+                                });
+                            },
+                        )),
+                    )
+                    .child(
+                        ui::SegmentedControl::editor(
+                            &theme,
                             "voice-isolation",
                             isolation_options
                                 .iter()

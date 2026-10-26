@@ -1,5 +1,6 @@
 mod audio_data;
 mod calibration_store;
+mod deep_filter;
 mod latency;
 mod progressive;
 mod renderer;

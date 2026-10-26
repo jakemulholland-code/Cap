@@ -360,6 +360,11 @@ impl PreparingAudioMixer {
                                     window.channels(),
                                     self.sources.project.audio.isolation.strength(),
                                     self.voice_profiles[span.clip].unwrap_or_default(),
+                                )
+                                .with_denoiser(
+                                    crate::audio::voice_denoiser(
+                                        self.sources.project.audio.voice_model,
+                                    ),
                                 ),
                             ));
                         }

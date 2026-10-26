@@ -782,11 +782,14 @@ fn studio_sound_refresh_changes_live_pcm_and_cannot_restart_stopped_audio() {
     let original = audible_spec_with_duration(10);
     let mut enhanced = audible_spec_with_duration(10);
     enhanced.project.audio.improve = true;
+    enhanced.project.audio.voice_model = cap_project::VoiceModel::RnNoise;
     let mut strong = audible_spec_with_duration(10);
     strong.project.audio.improve = true;
+    strong.project.audio.voice_model = cap_project::VoiceModel::RnNoise;
     strong.project.audio.isolation = cap_project::VoiceIsolation::Strong;
     let mut light = audible_spec_with_duration(10);
     light.project.audio.improve = true;
+    light.project.audio.voice_model = cap_project::VoiceModel::RnNoise;
     light.project.audio.isolation = cap_project::VoiceIsolation::Light;
     let late_refresh = audible_spec();
     let (tx, rx) = std_mpsc::channel();

@@ -1,13 +1,60 @@
+use crate::deep_filter::DeepFilterStream;
 use crate::{AudioSampleSource, VoiceProfile, voice_level::VoiceFilter};
 use cap_rnnoise::{DELAY_SAMPLES, DenoiseState, FRAME_SIZE};
 use std::{collections::VecDeque, ops::Range};
 
 const FRAME: usize = FRAME_SIZE;
 pub const VOICE_PREROLL_SAMPLES: usize = 24_000;
-pub const VOICE_WINDOW_PADDING_SAMPLES: usize = FRAME * 9;
+pub const VOICE_WINDOW_PADDING_SAMPLES: usize = FRAME * 10;
+/// DeepFilterNet's local SNR estimate above which a frame counts as speech.
+const DEEP_FILTER_SPEECH_LSNR_DB: f32 = 6.0;
+
+/// Which network removes the noise before levelling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VoiceDenoiser {
+    /// The original engine, and the fallback when DeepFilterNet cannot load.
+    #[default]
+    RnNoise,
+    /// DeepFilterNet 3: full-band and clearer, for more CPU.
+    DeepFilterNet,
+}
+
+enum Engine {
+    RnNoise(Vec<DenoiseState>),
+    DeepFilter {
+        stream: DeepFilterStream,
+        input: Vec<f32>,
+        output: Vec<f32>,
+    },
+}
+
+impl Engine {
+    fn new(denoiser: VoiceDenoiser, channels: usize) -> Self {
+        if denoiser == VoiceDenoiser::DeepFilterNet
+            && let Some(stream) = DeepFilterStream::open(channels, FRAME)
+        {
+            return Self::DeepFilter {
+                stream,
+                input: vec![0.0; FRAME * channels],
+                output: Vec::with_capacity(FRAME * channels),
+            };
+        }
+        Self::RnNoise((0..channels).map(|_| DenoiseState::new()).collect())
+    }
+
+    /// Samples between a frame going in and its denoised copy coming out.
+    fn delay(&self) -> usize {
+        match self {
+            Self::RnNoise(_) => DELAY_SAMPLES,
+            Self::DeepFilter { stream, .. } => stream.delay,
+        }
+    }
+}
 
 pub struct VoiceEnhancer {
-    states: Vec<DenoiseState>,
+    engine: Engine,
+    channels: usize,
+    delay: usize,
     next_input: usize,
     expected_start: Option<usize>,
     warm_start: usize,
@@ -23,15 +70,23 @@ pub struct VoiceEnhancer {
 
 impl VoiceEnhancer {
     pub fn new(channels: u16) -> Self {
+        Self::build(channels, VoiceDenoiser::default())
+    }
+
+    fn build(channels: u16, denoiser: VoiceDenoiser) -> Self {
         let channels = usize::from(channels.clamp(1, 2));
+        let engine = Engine::new(denoiser, channels);
+        let delay = engine.delay();
         Self {
-            states: (0..channels).map(|_| DenoiseState::new()).collect(),
+            engine,
+            channels,
+            delay,
             next_input: 0,
             expected_start: None,
             warm_start: 0,
             pending_start: 0,
             pending: VecDeque::new(),
-            previous: vec![0.0; DELAY_SAMPLES * channels],
+            previous: vec![0.0; delay * channels],
             frame: vec![0.0; FRAME * channels],
             wet: 0.9,
             profile: None,
@@ -51,13 +106,32 @@ impl VoiceEnhancer {
         enhancer
     }
 
+    /// Swaps the noise remover. Falls back to RNNoise when DeepFilterNet
+    /// cannot load.
+    pub fn with_denoiser(self, denoiser: VoiceDenoiser) -> Self {
+        let channels = self.channels as u16;
+        Self {
+            wet: self.wet,
+            profile: self.profile,
+            ..Self::build(channels, denoiser)
+        }
+    }
+
+    /// The engine actually in use, after any fallback.
+    pub fn denoiser(&self) -> VoiceDenoiser {
+        match self.engine {
+            Engine::RnNoise(_) => VoiceDenoiser::RnNoise,
+            Engine::DeepFilter { .. } => VoiceDenoiser::DeepFilterNet,
+        }
+    }
+
     pub fn speech_frames(&self) -> usize {
         self.speech_frames
     }
 
     pub fn is_contiguous(&self, start: usize) -> bool {
         self.expected_start == Some(start)
-            || (self.pending_start..self.pending_start + self.pending.len() / self.states.len())
+            || (self.pending_start..self.pending_start + self.pending.len() / self.channels)
                 .contains(&start)
     }
 
@@ -70,7 +144,7 @@ impl VoiceEnhancer {
         } else {
             (start / FRAME * FRAME).saturating_sub(VOICE_PREROLL_SAMPLES)
         };
-        let padding = if self.profile.is_some() { 7 } else { 3 };
+        let padding = self.delay / FRAME + if self.profile.is_some() { 5 } else { 1 };
         let end = start
             .saturating_add(count)
             .div_ceil(FRAME)
@@ -84,7 +158,7 @@ impl VoiceEnhancer {
         let end = start
             .saturating_add(count)
             .div_ceil(FRAME)
-            .saturating_add(7)
+            .saturating_add(8)
             .saturating_mul(FRAME);
         first..end.max(first)
     }
@@ -95,7 +169,7 @@ impl VoiceEnhancer {
         start: usize,
         count: usize,
     ) -> VoiceAudio {
-        let channels = self.states.len();
+        let channels = self.channels;
         let count = count.min(source.sample_count().saturating_sub(start));
         if count == 0 {
             return VoiceAudio {
@@ -112,7 +186,7 @@ impl VoiceEnhancer {
             self.pending.clear();
             self.previous.fill(0.0);
             if self.expected_start.is_some() {
-                self.states = (0..channels).map(|_| DenoiseState::new()).collect();
+                self.engine = Engine::new(self.denoiser(), channels);
             }
             self.speech_frames = 0;
             self.leveler = self.profile.and_then(|profile| {
@@ -151,33 +225,70 @@ impl VoiceEnhancer {
     }
 
     fn process_frame<T: AudioSampleSource>(&mut self, source: &T) {
-        let channels = self.states.len();
+        let channels = self.channels;
         let mut input = [0.0; FRAME];
         let mut output = [0.0; FRAME];
-        let delayed = (self.next_input / FRAME % 2) * FRAME * channels;
-        let mut speech = false;
-        for (channel, state) in self.states.iter_mut().enumerate() {
-            for (index, sample) in input.iter_mut().enumerate() {
-                let value = source
-                    .sample((self.next_input + index) * channels + channel)
-                    .copied()
-                    .unwrap_or(0.0);
-                *sample = if value.is_finite() {
-                    value.clamp(-1.0, 1.0) * 32_768.0
-                } else {
-                    0.0
-                };
+        let delayed = (self.next_input / FRAME % (self.delay / FRAME)) * FRAME * channels;
+        let raw = |index: usize, channel: usize| {
+            let value = source
+                .sample((self.next_input + index) * channels + channel)
+                .copied()
+                .unwrap_or(0.0);
+            if value.is_finite() {
+                value.clamp(-1.0, 1.0)
+            } else {
+                0.0
             }
-            speech |= state.process_frame(&mut output, &input) > 0.6;
-            for (index, (&clean, &raw)) in output.iter().zip(&input).enumerate() {
-                let index = index * channels + channel;
-                self.frame[index] =
-                    clean / 32_768.0 * self.wet + self.previous[delayed + index] * (1.0 - self.wet);
-                self.previous[delayed + index] = raw / 32_768.0;
+        };
+        let speech = match &mut self.engine {
+            Engine::RnNoise(states) => {
+                let mut speech = false;
+                for (channel, state) in states.iter_mut().enumerate() {
+                    for (index, sample) in input.iter_mut().enumerate() {
+                        *sample = raw(index, channel) * 32_768.0;
+                    }
+                    speech |= state.process_frame(&mut output, &input) > 0.6;
+                    for (index, (&clean, &raw)) in output.iter().zip(&input).enumerate() {
+                        let index = index * channels + channel;
+                        self.frame[index] = clean / 32_768.0 * self.wet
+                            + self.previous[delayed + index] * (1.0 - self.wet);
+                        self.previous[delayed + index] = raw / 32_768.0;
+                    }
+                }
+                speech
             }
-        }
+            Engine::DeepFilter {
+                stream,
+                input,
+                output,
+            } => {
+                for channel in 0..channels {
+                    for index in 0..FRAME {
+                        input[channel * FRAME + index] = raw(index, channel);
+                    }
+                }
+                output.clear();
+                output.extend_from_slice(input);
+                let lsnr = stream.process(output).unwrap_or_else(|error| {
+                    tracing::warn!(%error, "DeepFilterNet failed on a frame; passing it through");
+                    output.clear();
+                    output.extend_from_slice(input);
+                    f32::NEG_INFINITY
+                });
+                for channel in 0..channels {
+                    for index in 0..FRAME {
+                        let planar = channel * FRAME + index;
+                        let interleaved = index * channels + channel;
+                        self.frame[interleaved] = output[planar] * self.wet
+                            + self.previous[delayed + interleaved] * (1.0 - self.wet);
+                        self.previous[delayed + interleaved] = input[planar];
+                    }
+                }
+                lsnr > DEEP_FILTER_SPEECH_LSNR_DB
+            }
+        };
         self.speech_frames += usize::from(speech);
-        if self.next_input >= self.warm_start + DELAY_SAMPLES {
+        if self.next_input >= self.warm_start + self.delay {
             if let Some(leveler) = &mut self.leveler {
                 if let Err(error) = leveler.process(&self.frame, &mut self.pending) {
                     tracing::warn!(%error, "Studio Sound leveling failed");
@@ -401,6 +512,7 @@ mod tests {
             let profile = VoiceProfile {
                 gain_db: 12.0,
                 makeup_db: 2.0,
+                ..VoiceProfile::default()
             };
             let expected = VoiceEnhancer::with_settings(channels, 0.9, profile).render(
                 &source,
@@ -546,7 +658,7 @@ mod tests {
                 .iter()
                 .all(|sample| sample.is_finite() && sample.abs() <= 1.0)
         );
-        assert_eq!(enhancer.states.len(), 1);
+        assert_eq!(enhancer.channels, 1);
         assert_eq!(enhancer.frame.len(), FRAME);
         assert_eq!(enhancer.previous.len(), DELAY_SAMPLES);
     }

@@ -8,6 +8,8 @@ test-support = []
 
 [dependencies]
 cap-rnnoise = { path = "../rnnoise" }
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"] }
+ndarray = "0.15"
 cap-enc-ffmpeg = { path = "../enc-ffmpeg" }
 ffmpeg = { workspace = true }
 cpal = { workspace = true }

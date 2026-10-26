@@ -660,6 +660,7 @@ pub struct AudioConfiguration {
     pub mic_volume_db: f32,
     pub mic_stereo_mode: StereoMode,
     pub system_volume_db: f32,
+    pub voice_model: VoiceModel,
 }
 
 impl Default for AudioConfiguration {
@@ -671,8 +672,20 @@ impl Default for AudioConfiguration {
             mic_volume_db: 0.0,
             mic_stereo_mode: StereoMode::default(),
             system_volume_db: 0.0,
+            voice_model: VoiceModel::default(),
         }
     }
+}
+
+/// The network Studio Sound removes noise with.
+#[derive(Type, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum VoiceModel {
+    /// DeepFilterNet 3, falling back to RNNoise if it cannot load.
+    #[default]
+    DeepFilterNet,
+    /// RNNoise, the original engine.
+    RnNoise,
 }
 
 #[derive(Type, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
