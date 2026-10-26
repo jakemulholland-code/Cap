@@ -1467,6 +1467,9 @@ pub struct EditorWindow {
     auto_edit_settings: crate::editor_auto_edit::AutoEditSettings,
     auto_edit_activity: Option<Arc<Vec<Vec<f64>>>>,
     loading_auto_edit_activity: bool,
+    auto_edit_transcript: Option<Arc<Vec<cap_project::CaptionSegment>>>,
+    loading_auto_edit_transcript: bool,
+    auto_edit_transcript_error: Option<String>,
     timeline_scroll: gpui::ScrollHandle,
     minimap_drag: Option<timeline::MinimapDrag>,
     /// Magnetic edges for the live drag: playhead, clip cuts and every other
@@ -2114,6 +2117,9 @@ impl EditorWindow {
             auto_edit_settings: Default::default(),
             auto_edit_activity: None,
             loading_auto_edit_activity: false,
+            auto_edit_transcript: None,
+            loading_auto_edit_transcript: false,
+            auto_edit_transcript_error: None,
             timeline_scroll: gpui::ScrollHandle::new(),
             minimap_drag: None,
             drag_snap_targets: snap::SnapTargets::default(),
@@ -3083,10 +3089,12 @@ impl EditorWindow {
         // the end, which is what makes the button show Play again and the next
         // press restart from 0.
         // `Play shot` stops itself at the shot's own end, the way the
-        // end-of-media effect stops at the timeline's.
+        // end-of-media effect stops at the timeline's. Auto edit's "Play all"
+        // moves on to its next cut instead.
         if self.playing
             && let Some(until) = self.play_until
             && next >= until - 1. / f64::from(EDITOR_PREVIEW_FPS)
+            && !self.advance_auto_edit_preview(cx)
         {
             self.stop_playback(cx);
         }
@@ -10581,7 +10589,7 @@ impl EditorWindow {
                             .id("transport-auto-edit-tooltip")
                             .tooltip_show_delay(crate::ui::TOOLTIP_SHOW_DELAY)
                             .tooltip(move |_, cx| {
-                                ui::Tooltip::new(&theme, "Preview and cut silent, idle sections")
+                                ui::Tooltip::new(&theme, "Preview and cut silences, coughs and retakes")
                                     .view(cx)
                             })
                             .child(

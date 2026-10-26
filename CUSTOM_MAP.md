@@ -25,12 +25,21 @@ are hints that drift. Read only the region you need from the big files.
 
 ### Auto edit (cut silent and idle sections)
 - `apps/desktop-gpui/src/editor_auto_edit.rs`: pure logic plus tests. `AutoEditSettings`, `AutoEditTransition`,
-  `detect_empty_sections` (10 bins/s from waveform dB tables plus activity), `apply_cuts` (descending
-  split/delete, then `add_clip_transition` on new joins), `load_recording_activity` (cursor moves/clicks
-  plus key presses, from project meta).
+  `RetakeMode`, `CutReason` (Silence/Noise/Retake). Entry point `detect_cuts` = `detect_empty_sections`
+  (10 bins/s from waveform dB tables plus activity; threshold from `measure_levels` (Otsu split, midway between
+  room and speech) unless a fixed one is picked; `noise_mask` folds isolated bursts with no transcript word,
+  or much louder than speech, into the silence) + `retake_cuts` (`retake_ranges`: spoken cues in
+  `RETAKE_CUES` roll back via fuzzy `matching_attempt` or `sentence_start`; `repeated_lines` catches a
+  restarted line without a cue), then `merge_cuts`. `transcript_words` flattens caption segments into
+  per-recording words. `cut_output_range` maps a cut to output time. `apply_cuts`, `load_recording_activity`.
+  Tests include a real 36 s take (`RECORDED_LEVELS`/`RECORDED_WORDS`); the mic waveform is mean-abs dBFS where
+  exact -60 means digital zero, and a typical mic speaks near -50 with room tone near -95.
 - `apps/desktop-gpui/src/editor_window/auto_edit.rs`: `AutoEditPanel`, `toggle_auto_edit`,
-  `refresh_auto_edit_preview`, `apply_auto_edit`, `render_auto_edit_overlays` (red boxes on the clip lane),
-  `render_auto_edit_popover`.
+  `load_auto_edit_transcript` (transcribes with the downloaded caption model when the project has no captions,
+  kept in `auto_edit_transcript`, not written to the project), `refresh_auto_edit_preview`, preview
+  (`step_auto_edit_cut`, `play_auto_edit_cut`, `advance_auto_edit_preview` hooked into the `play_until` stop in
+  `playhead_changed`), `apply_auto_edit`, `render_auto_edit_overlays`, `render_auto_edit_popover`.
+- Icons must be registered in `src/assets.rs` `ICONS` or gpui draws nothing (this is why `sparkles.svg` was blank).
 - Hooks in `editor_window.rs`: fields `auto_edit*` (~1466); `refresh_auto_edit_preview()` at the end of
   `rebuild_timeline` and in `set_waveforms`; Esc handler near `self.clip_speed.is_some() && ... "escape"`;
   button `"transport-auto-edit"` in `render_transport`; overlays and popover are mounted next to the
