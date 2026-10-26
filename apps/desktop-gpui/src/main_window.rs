@@ -3625,6 +3625,7 @@ impl MainWindow {
                 "screenshots" => tr::main::header::screenshots(),
                 "recordings" => tr::main::header::recordings(),
                 "teleprompter" => tr::main::header::teleprompter(),
+                "guided-recording" => "Guided Recording",
                 "changelog" => tr::main::header::changelog(),
                 _ => unreachable!(),
             };
