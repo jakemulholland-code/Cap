@@ -3719,6 +3719,13 @@ impl MainWindow {
                         ),
                     )
                     .child(
+                        icon_button("guided-recording", "icons/clapperboard.svg", 16.).on_click(
+                            cx.listener(|_, _, _window, cx| {
+                                cx.defer(app_windows::open_guided_recording);
+                            }),
+                        ),
+                    )
+                    .child(
                         icon_button("teleprompter", "icons/scan-text.svg", 16.).on_click(
                             cx.listener(|_, _, _window, cx| {
                                 // `onClick={() => void openTeleprompter()}` on
