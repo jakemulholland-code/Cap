@@ -16,7 +16,9 @@ use gpui::{AnyElement, Task};
 
 use super::*;
 use crate::guided_build;
+use crate::guided_listen;
 use crate::guided_media::{self, Pace, Player, PlayerVideo, SlideClock};
+use crate::guided_prompt::{self, PromptWord};
 use crate::guided_recording::{SegmentPlan, Take};
 use crate::recording::{self, ActiveRecording, RecordingMode, StartConfig};
 
@@ -24,11 +26,10 @@ const COUNTDOWN_SECS: f64 = 3.0;
 const TICK: Duration = Duration::from_millis(16);
 const PREVIEW_MAX_WIDTH: u32 = 960;
 const CAMERA_MAX_WIDTH: u32 = 480;
-const PROMPT_TEXT_SIZE: f32 = 34.;
-const PROMPT_TAIL: f32 = 4000.;
-/// Where the word being read sits across the prompt bar.
-const PROMPT_ANCHOR: f32 = 0.3;
-const PROMPT_EASE: f32 = 0.2;
+const PROMPT_TEXT_SIZE: f32 = 22.;
+const PROMPT_WIDTH: f32 = 620.;
+const PROMPT_BEFORE: usize = 1;
+const PROMPT_AFTER: usize = 3;
 const WPM_STEP: f64 = 10.0;
 const MIN_WPM: f64 = 80.0;
 const MAX_WPM: f64 = 220.0;
@@ -62,7 +63,7 @@ pub(super) struct Recorder {
     recording_began: Option<Instant>,
     player: Option<Player>,
     shown: Vec<Option<Arc<RenderImage>>>,
-    prompt: ScrollHandle,
+    listener: Option<guided_listen::Listener>,
     ticker: Option<Task<()>>,
     message: Option<String>,
     /// Slow the slide to fit the script at `wpm` (normal speed in step mode).
@@ -85,7 +86,7 @@ impl Default for Recorder {
             recording_began: None,
             player: None,
             shown: Vec::new(),
-            prompt: ScrollHandle::new(),
+            listener: None,
             ticker: None,
             message: None,
             match_pace: true,
@@ -112,7 +113,6 @@ impl GuidedRecordingWindow {
                 .position(|section| section.chosen_take().is_none())
         });
         self.recorder.current = first_missing.unwrap_or(0);
-        self.recorder.prompt.set_offset(gpui::point(px(0.), px(0.)));
         self.stage = Stage::Record;
         self.find_beats(cx);
         cx.notify();
@@ -264,7 +264,6 @@ impl GuidedRecordingWindow {
         self.recorder.current = index;
         self.recorder.speed = None;
         self.recorder.message = None;
-        self.recorder.prompt.set_offset(gpui::point(px(0.), px(0.)));
         cx.notify();
     }
 
@@ -309,7 +308,6 @@ impl GuidedRecordingWindow {
 
         self.recorder.phase = Phase::Starting;
         self.recorder.message = None;
-        self.recorder.prompt.set_offset(gpui::point(px(0.), px(0.)));
         cx.notify();
         let task = gpui_tokio::Tokio::spawn(cx, recording::start(config));
         cx.spawn_in(window, async move |this, cx| {
@@ -323,6 +321,7 @@ impl GuidedRecordingWindow {
                             began: Instant::now(),
                         };
                         crate::app_sounds::AppSound::StartRecording.play();
+                        this.start_listener(cx);
                         this.start_ticker(window, cx);
                     }
                     Ok(Err(error)) => this.take_failed(format!("{error:#}"), cx),
@@ -335,7 +334,38 @@ impl GuidedRecordingWindow {
         .detach();
     }
 
+    /// Listens to the reader so the prompt keeps their place.
+    fn start_listener(&mut self, cx: &mut Context<Self>) {
+        let Some(section) = self.section() else {
+            return;
+        };
+        let script: Vec<String> = guided_prompt::prompt_words(&section.text)
+            .into_iter()
+            .map(|word| word.key)
+            .collect();
+        let Some(actor) = crate::feeds::Feeds::global(cx).read(cx).mic_actor() else {
+            return;
+        };
+        let (sender, samples) = flume::bounded(64);
+        gpui_tokio::Tokio::spawn(cx, async move {
+            if let Err(error) = actor
+                .ask(cap_recording::feeds::microphone::AddSender(sender))
+                .await
+            {
+                tracing::warn!(%error, "could not listen to the microphone");
+            }
+        })
+        .detach();
+        self.recorder.listener = Some(guided_listen::Listener::start(
+            samples,
+            script,
+            self.recorder.wpm,
+            crate::transcription::live_model_dir(),
+        ));
+    }
+
     fn take_failed(&mut self, error: String, cx: &mut Context<Self>) {
+        self.recorder.listener = None;
         tracing::error!(%error, "guided take failed");
         self.recorder.phase = Phase::Idle;
         self.recorder.message = Some(format!("Recording failed: {error}"));
@@ -377,6 +407,7 @@ impl GuidedRecordingWindow {
             return;
         };
         let duration = video_start.elapsed().as_secs_f64();
+        self.recorder.listener = None;
         let timing = self
             .recorder
             .clock
@@ -461,6 +492,7 @@ impl GuidedRecordingWindow {
                     .detach();
                 }
                 self.recorder.clock = None;
+                self.recorder.listener = None;
                 self.recorder.phase = Phase::Idle;
                 self.recorder.message = Some("Take discarded.".to_string());
             }
@@ -658,7 +690,7 @@ impl GuidedRecordingWindow {
                     self.begin_rolling();
                 }
             }
-            Phase::Rolling { .. } => self.follow_prompt(),
+            Phase::Rolling { .. } => {}
             Phase::Reviewing => {
                 if self
                     .recorder
@@ -682,37 +714,20 @@ impl GuidedRecordingWindow {
         true
     }
 
-    /// The word to be reading now, at the wpm setting.
-    fn prompt_word(&self) -> Option<usize> {
-        let words = self.section()?.word_count();
+    /// The word the reader is on: followed by ear while recording, else at
+    /// the wpm setting.
+    fn prompt_word(&self, words: usize) -> Option<usize> {
         match self.recorder.phase {
             Phase::Countdown { .. } => Some(0),
-            Phase::Rolling { video_start } => {
-                let read = video_start.elapsed().as_secs_f64() * self.recorder.wpm / 60.0;
-                Some((read as usize).min(words.saturating_sub(1)))
-            }
+            Phase::Rolling { video_start } => Some(match &self.recorder.listener {
+                Some(listener) => listener.word(),
+                None => {
+                    let read = video_start.elapsed().as_secs_f64() * self.recorder.wpm / 60.0;
+                    (read as usize).min(words.saturating_sub(1))
+                }
+            }),
             _ => None,
         }
-    }
-
-    /// Slides the prompt bar so the word being read sits at the anchor.
-    fn follow_prompt(&mut self) {
-        let prompt = &self.recorder.prompt;
-        let Some(word) = self
-            .prompt_word()
-            .and_then(|word| prompt.bounds_for_item(word))
-        else {
-            return;
-        };
-        let bar = prompt.bounds();
-        let target = (bar.size.width * PROMPT_ANCHOR - (word.left() - bar.left()))
-            .min(px(0.))
-            .max(-prompt.max_offset().x);
-        let offset = prompt.offset().x;
-        prompt.set_offset(gpui::point(
-            offset + (target - offset) * PROMPT_EASE,
-            px(0.),
-        ));
     }
 
     /// The player's newest pictures, handing the replaced ones back to the
@@ -987,54 +1002,118 @@ impl GuidedRecordingWindow {
                 )
             });
 
-        let reading = self.prompt_word();
+        let words = guided_prompt::prompt_words(&section.text);
+        let reading = self.prompt_word(words.len());
+        let focus = reading.unwrap_or(0).min(words.len().saturating_sub(1));
+        let word_chip = |word: &PromptWord, now: bool, said: bool| {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .px(px(6.))
+                        .rounded(px(5.))
+                        .text_color(if said {
+                            gpui::hsla(0., 0., 1., 0.4)
+                        } else {
+                            gpui::white()
+                        })
+                        .when(now, |this| {
+                            this.bg(Hsla::from(theme.blue_9))
+                                .font_weight(FontWeight::BOLD)
+                        })
+                        .child(word.text.clone()),
+                )
+                .when(word.pause, |this| {
+                    this.child(
+                        div()
+                            .px(px(4.))
+                            .text_color(gpui::hsla(0., 0., 1., 0.35))
+                            .child("‖"),
+                    )
+                })
+        };
+        let before = &words[focus.saturating_sub(PROMPT_BEFORE)..focus];
+        let after =
+            &words[(focus + 1).min(words.len())..(focus + 1 + PROMPT_AFTER).min(words.len())];
+        let listening = self.recorder.listener.as_ref();
         let prompt = div()
-            .id("guided-prompt")
             .flex_none()
             .w_full()
             .flex()
-            .items_center()
-            .overflow_x_scroll()
-            .track_scroll(&self.recorder.prompt)
-            .px(px(24.))
-            .py(px(14.))
-            .bg(gpui::hsla(0., 0., 0.08, 1.))
-            .text_size(px(PROMPT_TEXT_SIZE))
-            .line_height(px(PROMPT_TEXT_SIZE * 1.3))
-            .font_weight(FontWeight::MEDIUM)
-            .children(
-                section
-                    .text
-                    .split_whitespace()
-                    .enumerate()
-                    .map(|(index, word)| {
-                        let now = reading == Some(index);
-                        let said = reading.is_some_and(|reading| index < reading);
+            .justify_center()
+            .px(px(16.))
+            .py(px(10.))
+            .child(
+                div()
+                    .relative()
+                    .w(px(PROMPT_WIDTH))
+                    .max_w_full()
+                    .flex()
+                    .items_center()
+                    .px(px(16.))
+                    .py(px(10.))
+                    .rounded(px(12.))
+                    .bg(gpui::hsla(0., 0., 0.08, 1.))
+                    .text_size(px(PROMPT_TEXT_SIZE))
+                    .line_height(px(PROMPT_TEXT_SIZE * 1.35))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(
                         div()
-                            .flex_none()
-                            .mr(px(10.))
-                            .px(px(6.))
-                            .rounded(px(6.))
-                            .text_color(if said {
-                                gpui::hsla(0., 0., 1., 0.35)
-                            } else {
-                                gpui::white()
-                            })
-                            .when(now, |this| {
-                                this.bg(Hsla::from(theme.blue_9))
-                                    .font_weight(FontWeight::BOLD)
-                            })
-                            .child(word.to_string())
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .justify_end()
+                            .overflow_hidden()
+                            .children(before.iter().map(|word| word_chip(word, false, true))),
+                    )
+                    .children(
+                        words
+                            .get(focus)
+                            .map(|word| word_chip(word, reading.is_some(), false)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .overflow_hidden()
+                            .children(after.iter().map(|word| word_chip(word, false, false))),
+                    )
+                    .when_some(listening, |this, listener| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top(px(8.))
+                                .right(px(8.))
+                                .size(px(7.))
+                                .rounded_full()
+                                .bg(if listener.speaking() {
+                                    gpui::hsla(0.39, 0.7, 0.5, 1.)
+                                } else {
+                                    gpui::hsla(0., 0., 1., 0.25)
+                                }),
+                        )
                     }),
-            )
-            .child(div().flex_none().w(px(PROMPT_TAIL)).h(px(1.)));
+            );
         let prompt_info = format!(
-            "{}. {} · {} words · about {:.0}s at {:.0} wpm",
+            "{}. {} · {} words · about {:.0}s at {:.0} wpm · {}",
             current + 1,
             section.title,
-            section.word_count(),
-            section.word_count() as f64 * 60.0 / self.recorder.wpm,
-            self.recorder.wpm
+            words.len(),
+            words.len() as f64 * 60.0 / self.recorder.wpm,
+            self.recorder.wpm,
+            match listening {
+                Some(listener) if listener.hearing() => "the prompt follows your words",
+                Some(_) => "the prompt moves while you speak",
+                None if crate::transcription::live_model_dir().is_some() => {
+                    "the prompt will follow your words"
+                }
+                None => {
+                    "the prompt will move while you speak (download a Parakeet caption model to follow your words)"
+                }
+            }
         );
 
         let record_label = match self.recorder.phase {
@@ -1209,6 +1288,9 @@ impl GuidedRecordingWindow {
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.recorder.wpm = (this.recorder.wpm - WPM_STEP).max(MIN_WPM);
+                        if let Some(listener) = &this.recorder.listener {
+                            listener.set_wpm(this.recorder.wpm);
+                        }
                         this.recorder.speed = None;
                         cx.notify();
                     })),
@@ -1219,6 +1301,9 @@ impl GuidedRecordingWindow {
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.recorder.wpm = (this.recorder.wpm + WPM_STEP).min(MAX_WPM);
+                        if let Some(listener) = &this.recorder.listener {
+                            listener.set_wpm(this.recorder.wpm);
+                        }
                         this.recorder.speed = None;
                         cx.notify();
                     })),

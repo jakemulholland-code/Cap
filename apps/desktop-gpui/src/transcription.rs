@@ -1618,12 +1618,9 @@ fn parakeet_chunk_ranges(samples: &[f32], sample_rate: usize) -> Vec<std::ops::R
     ranges
 }
 
-/// `process_with_parakeet` (`captions.rs:1202-1302`).
+/// The cached Parakeet TDT model for `model_dir`, loading it if needed.
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-fn process_with_parakeet(
-    audio_path: &Path,
-    model_dir: &str,
-) -> Result<Vec<CaptionSegment>, String> {
+fn parakeet_model(model_dir: &str) -> Result<Arc<Mutex<ParakeetTDT>>, String> {
     let cached_model = {
         let guard = PARAKEET_CONTEXT
             .lock()
@@ -1662,6 +1659,55 @@ fn process_with_parakeet(
             loaded_model
         }
     };
+
+    Ok(model_arc)
+}
+
+/// A downloaded Parakeet model folder fast enough to follow speech live.
+pub fn live_model_dir() -> Option<String> {
+    ["best", "best-max"]
+        .into_iter()
+        .find(|model| model_files_present(model))
+        .map(|model| model_path(model).to_string_lossy().into_owned())
+}
+
+/// The words Parakeet hears in `samples` (16 kHz mono).
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+pub fn hear_words(model_dir: &str, samples: &[f32]) -> Result<Vec<String>, String> {
+    let model = parakeet_model(model_dir)?;
+    let mut samples = samples.to_vec();
+    normalize_audio_for_transcription(&mut samples);
+    let mut parakeet = model
+        .lock()
+        .map_err(|e| format!("Failed to lock Parakeet model: {e}"))?;
+    let result = parakeet
+        .transcribe_samples(samples, WHISPER_SAMPLE_RATE, 1, Some(TimestampMode::Words))
+        .map_err(|e| format!("Parakeet transcription failed: {e}"))?;
+    Ok(result
+        .tokens
+        .into_iter()
+        .map(|token| token.text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub fn hear_words(_model_dir: &str, _samples: &[f32]) -> Result<Vec<String>, String> {
+    Err(PARAKEET_UNSUPPORTED_MESSAGE.to_string())
+}
+
+/// Lets the live model go after the usual idle time.
+pub fn release_live_model() {
+    schedule_parakeet_release();
+}
+
+/// `process_with_parakeet` (`captions.rs:1202-1302`).
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+fn process_with_parakeet(
+    audio_path: &Path,
+    model_dir: &str,
+) -> Result<Vec<CaptionSegment>, String> {
+    let model_arc = parakeet_model(model_dir)?;
 
     let mut reader = hound::WavReader::open(audio_path)
         .map_err(|e| format!("Failed to open audio file: {e} at path: {audio_path:?}"))?;
@@ -1857,8 +1903,8 @@ fn extract_audio_from_video(video_path: &Path, output_path: &Path) -> Result<(),
 // ---------------------------------------------------------------------------
 
 use cap_project::caption_words::{
-    caption_text_from_words, caption_word_chunks, normalize_caption_words,
-    MAX_CAPTION_WORD_DURATION,
+    MAX_CAPTION_WORD_DURATION, caption_text_from_words, caption_word_chunks,
+    normalize_caption_words,
 };
 
 // ---------------------------------------------------------------------------

@@ -75,12 +75,22 @@ are hints that drift. Read only the region you need from the big files.
 - `apps/desktop-gpui/src/guided_window/recorder.rs`: `Recorder`/`Phase`. Takes are `recording::start` with
   `ScreenCaptureTarget::CameraOnly` + the main window's camera/mic from `Feeds`, stopped with
   `ActiveRecording::stop`, cancelled with `cancel_and_delete`. 3 s countdown, then the slide plays and the
-  script runs along a one-line bar at the top (`prompt_word` = word due at the wpm, highlighted; `follow_prompt`
-  eases it to `PROMPT_ANCHOR`). The slide runs on a `SlideClock` at `slide_speed` (hand-picked, else fitted to
+  script shows in a centred pill at the top: the previous word, the current one highlighted, the next
+  `PROMPT_AFTER` (`prompt_word`: the listener's word while recording, else the wpm). The slide runs on a `SlideClock` at `slide_speed` (hand-picked, else fitted to
   the wpm, normal in step mode); step mode (on by default) waits at each beat, and `next_step` resumes or, mid
   animation, moves `stop_point` on a beat. Keys (caught in `capture_key_down` on the window root, which refocuses
   on every click because buttons take focus): Space record/stop, Esc cancel, → next animation while recording
   (next section when idle), ← previous section, ↑/↓ slide speed (live while recording).
+- `apps/desktop-gpui/src/guided_prompt.rs`: `prompt_words` (shown words: spoken numbers to figures incl. %, £,
+  decimals, ordinals and years; `(pause)` sets `pause`, `---` dropped; `key` for matching), `heard_keys` (rejoins
+  Parakeet's split figures), `follow_heard` (LCS of the last heard words against the script near the place;
+  backward only for a restart of 3+ words).
+- `apps/desktop-gpui/src/guided_listen.rs`: `Listener` taps the mic feed (`microphone::AddSender`; dropping the
+  receiver unhooks it). One thread keeps 3 s at 16 kHz and detects speech (level over a tracked room floor);
+  another runs `transcription::hear_words` (Parakeet via `live_model_dir`, cached `parakeet_model`) every 0.5 s and
+  moves the place. Between matches it runs up to 3 words ahead at the wpm while speaking; with no model it moves
+  only while speaking. Ignored test `real_follow_replay` (`CAP_GUIDED_MIC`, `CAP_GUIDED_TEXT`) replays audio
+  through it; a Windows SAPI read of the script works as test audio.
 - Wiring: `app_windows::open_guided_recording` / `guided_recording_closed` (field `guided`, skipped in
   `own_windows`), `TrayItem::GuidedRecording`, `editor_clips::decode_thumbnail_frame` and import's H.264 helpers
   are `pub(crate)`. Harness: `CAP_GPUI_AUTO_TRAY=guided_recording`, `CAP_GPUI_AUTO_GUIDED=<session.json>[,record]`,
