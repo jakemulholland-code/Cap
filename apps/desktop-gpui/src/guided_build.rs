@@ -250,6 +250,7 @@ mod tests {
             length,
             source_start: from,
             source_end: from + length,
+            timing: Vec::new(),
         };
         let fps = guided_media::write_segment_display(video, &plan, &segment.join("display.mp4"))
             .unwrap();
@@ -293,6 +294,7 @@ mod tests {
             project_path: dir.to_path_buf(),
             lead_secs: 3.3,
             duration: length - 3.1,
+            timing: Vec::new(),
         }
     }
 
@@ -314,11 +316,15 @@ mod tests {
             video_duration: samples.duration,
             sections,
             cuts: cuts.iter().map(|cut| cut.time).collect(),
+            beats: None,
         };
         let lengths = [18.0, 22.0, 30.0];
         for (index, length) in lengths.into_iter().enumerate() {
             let dir = session.next_take_path(index);
-            let take = fake_take(&video, &dir, 60.0 + index as f64 * 30.0, length);
+            let mut take = fake_take(&video, &dir, 60.0 + index as f64 * 30.0, length);
+            if index == 1 {
+                take.timing = vec![[0.0, 14.0], [2.4, 15.2], [6.0, 15.2], [take.duration, 30.0]];
+            }
             session.add_take(index, take);
         }
         session.save().unwrap();
@@ -339,5 +345,28 @@ mod tests {
             assert!((segment.end - segment.start - (length - 3.1)).abs() < 1e-6);
         }
         assert!(config.audio.improve);
+
+        let second = SegmentPlan::new(
+            &session.sections[1],
+            session.sections[1].chosen_take().unwrap(),
+            0.2,
+        );
+        let audio = guided_media::segment_audio(&video, &second)
+            .unwrap()
+            .unwrap();
+        let channels = usize::from(audio.channels());
+        let loud = |from: f64, to: f64| {
+            let range = &audio.samples()
+                [(from * 48_000.0) as usize * channels..(to * 48_000.0) as usize * channels];
+            range
+                .iter()
+                .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
+        };
+        println!(
+            "slide audio peak while paused {:.3}, after resuming {:.3}",
+            loud(second.lead + 3.0, second.lead + 5.9),
+            loud(second.lead + 6.0, second.lead + 8.0)
+        );
+        assert!(loud(second.lead + 3.0, second.lead + 5.9) < 0.01);
     }
 }

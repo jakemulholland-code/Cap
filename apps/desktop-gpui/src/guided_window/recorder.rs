@@ -16,8 +16,8 @@ use gpui::{AnyElement, Task};
 
 use super::*;
 use crate::guided_build;
-use crate::guided_media::{self, Player, PlayerVideo};
-use crate::guided_recording::Take;
+use crate::guided_media::{self, Pace, Player, PlayerVideo, SlideClock};
+use crate::guided_recording::{SegmentPlan, Take};
 use crate::recording::{self, ActiveRecording, RecordingMode, StartConfig};
 
 const COUNTDOWN_SECS: f64 = 3.0;
@@ -32,6 +32,7 @@ const MIN_WPM: f64 = 80.0;
 const MAX_WPM: f64 = 220.0;
 /// How long a section's slide plays when nothing longer is asked for.
 const HOLD_LIMIT_SECS: f64 = 3600.0;
+const SPEED_STEP: f64 = 0.1;
 
 pub(super) enum Phase {
     Idle,
@@ -62,6 +63,14 @@ pub(super) struct Recorder {
     prompt: ScrollHandle,
     ticker: Option<Task<()>>,
     message: Option<String>,
+    /// Slow the slide to fit the script at `wpm` (normal speed in step mode).
+    match_pace: bool,
+    /// Pause after each animation until → is pressed.
+    step_mode: bool,
+    /// A speed picked by hand for this section, instead of the matched one.
+    speed: Option<f64>,
+    clock: Option<Arc<SlideClock>>,
+    finding_beats: bool,
 }
 
 impl Default for Recorder {
@@ -77,6 +86,11 @@ impl Default for Recorder {
             prompt: ScrollHandle::new(),
             ticker: None,
             message: None,
+            match_pace: true,
+            step_mode: false,
+            speed: None,
+            clock: None,
+            finding_beats: false,
         }
     }
 }
@@ -98,6 +112,84 @@ impl GuidedRecordingWindow {
         self.recorder.current = first_missing.unwrap_or(0);
         self.recorder.prompt.set_offset(gpui::point(px(0.), px(0.)));
         self.stage = Stage::Record;
+        self.find_beats(cx);
+        cx.notify();
+    }
+
+    /// Sessions saved before step mode existed have no step points yet.
+    fn find_beats(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        if session.beats.is_some() || self.recorder.finding_beats {
+            return;
+        }
+        self.recorder.finding_beats = true;
+        cx.spawn(async move |this, cx| {
+            let beats = cx
+                .background_executor()
+                .spawn(async move { guided_recording::session_beats(&session) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.recorder.finding_beats = false;
+                match beats {
+                    Ok(beats) => {
+                        if let Some(session) = &mut this.session {
+                            session.beats = Some(beats);
+                            if let Err(error) = session.save() {
+                                tracing::warn!(%error, "could not save the guided session");
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "could not find the slide's steps"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// How fast the slide plays: a speed picked by hand, else matched to the
+    /// reading pace, else normal.
+    fn slide_speed(&self) -> f64 {
+        if let Some(speed) = self.recorder.speed {
+            return speed;
+        }
+        match self.section() {
+            Some(section) if self.recorder.match_pace && !self.recorder.step_mode => {
+                guided_recording::slide_rate(section, self.recorder.wpm)
+            }
+            _ => 1.0,
+        }
+    }
+
+    fn change_speed(&mut self, delta: f64, cx: &mut Context<Self>) {
+        let speed = ((self.slide_speed() + delta) * 10.0).round() / 10.0;
+        let speed = speed.clamp(
+            guided_recording::MIN_SLIDE_RATE,
+            guided_recording::MAX_SLIDE_RATE,
+        );
+        self.recorder.speed = Some(speed);
+        if let Some(clock) = &self.recorder.clock {
+            clock.set_rate(speed);
+        }
+        cx.notify();
+    }
+
+    /// In step mode, plays the slide on to its next step point.
+    fn next_step(&mut self, cx: &mut Context<Self>) {
+        let Some(clock) = self.recorder.clock.clone() else {
+            return;
+        };
+        if !clock.waiting() {
+            return;
+        }
+        let next = self
+            .session
+            .as_ref()
+            .and_then(|session| session.next_beat(self.recorder.current, clock.source()));
+        clock.resume(next);
         cx.notify();
     }
 
@@ -116,11 +208,28 @@ impl GuidedRecordingWindow {
                 self.cancel(window, cx);
                 true
             }
-            "left" | "up" if !self.recorder.busy() => {
+            "right" if matches!(self.recorder.phase, Phase::Rolling { .. }) => {
+                self.next_step(cx);
+                true
+            }
+            "up" if matches!(self.recorder.phase, Phase::Rolling { .. })
+                || !self.recorder.busy() =>
+            {
+                self.change_speed(SPEED_STEP, cx);
+                true
+            }
+            "down"
+                if matches!(self.recorder.phase, Phase::Rolling { .. })
+                    || !self.recorder.busy() =>
+            {
+                self.change_speed(-SPEED_STEP, cx);
+                true
+            }
+            "left" if !self.recorder.busy() => {
                 self.select_section(self.recorder.current.saturating_sub(1), window, cx);
                 true
             }
-            "right" | "down" if !self.recorder.busy() => {
+            "right" if !self.recorder.busy() => {
                 self.select_section(self.recorder.current + 1, window, cx);
                 true
             }
@@ -141,6 +250,7 @@ impl GuidedRecordingWindow {
         }
         self.stop_player(cx);
         self.recorder.current = index;
+        self.recorder.speed = None;
         self.recorder.message = None;
         self.recorder.prompt.set_offset(gpui::point(px(0.), px(0.)));
         cx.notify();
@@ -221,22 +331,29 @@ impl GuidedRecordingWindow {
     }
 
     fn begin_rolling(&mut self) {
+        let speed = self.slide_speed();
         let Some(section) = self.section() else {
             return;
         };
         let Some(session) = &self.session else {
             return;
         };
+        let first_step = self
+            .recorder
+            .step_mode
+            .then(|| session.next_beat(self.recorder.current, section.start))
+            .flatten();
+        let clock = SlideClock::new(section.start, section.end, speed, first_step);
         let player = Player::start(
             vec![PlayerVideo {
                 path: session.video_path.clone(),
-                file_time: section.start,
-                until: section.duration(),
+                pace: Pace::Live(clock.clone()),
                 max_width: PREVIEW_MAX_WIDTH,
             }],
             None,
             HOLD_LIMIT_SECS,
         );
+        self.recorder.clock = Some(clock);
         self.recorder.player = Some(player);
         self.recorder.phase = Phase::Rolling {
             video_start: Instant::now(),
@@ -248,6 +365,12 @@ impl GuidedRecordingWindow {
             return;
         };
         let duration = video_start.elapsed().as_secs_f64();
+        let timing = self
+            .recorder
+            .clock
+            .take()
+            .map(|clock| clock.timing())
+            .unwrap_or_default();
         let lead = self
             .recorder
             .recording_began
@@ -265,7 +388,16 @@ impl GuidedRecordingWindow {
             let result = task.await;
             this.update_in(cx, |this, _window, cx| {
                 match result {
-                    Ok(Ok(path)) => this.keep_take(index, path, lead, duration, cx),
+                    Ok(Ok(path)) => this.keep_take(
+                        index,
+                        Take {
+                            project_path: path,
+                            lead_secs: lead,
+                            duration,
+                            timing,
+                        },
+                        cx,
+                    ),
                     Ok(Err(error)) => this.take_failed(format!("{error:#}"), cx),
                     Err(error) => this.take_failed(error.to_string(), cx),
                 }
@@ -276,37 +408,21 @@ impl GuidedRecordingWindow {
         .detach();
     }
 
-    fn keep_take(
-        &mut self,
-        index: usize,
-        recorded: PathBuf,
-        lead: f64,
-        duration: f64,
-        cx: &mut Context<Self>,
-    ) {
+    fn keep_take(&mut self, index: usize, mut take: Take, cx: &mut Context<Self>) {
         self.stop_player(cx);
         self.recorder.phase = Phase::Idle;
         let Some(session) = &mut self.session else {
             return;
         };
         let target = session.next_take_path(index);
-        let project_path = match std::fs::create_dir_all(session.takes_dir())
-            .and_then(|()| std::fs::rename(&recorded, &target))
+        match std::fs::create_dir_all(session.takes_dir())
+            .and_then(|()| std::fs::rename(&take.project_path, &target))
         {
-            Ok(()) => target,
-            Err(error) => {
-                tracing::warn!(%error, "could not move the take next to the session");
-                recorded
-            }
-        };
-        session.add_take(
-            index,
-            Take {
-                project_path,
-                lead_secs: lead,
-                duration,
-            },
-        );
+            Ok(()) => take.project_path = target,
+            Err(error) => tracing::warn!(%error, "could not move the take next to the session"),
+        }
+        let duration = take.duration;
+        session.add_take(index, take);
         if let Err(error) = session.save() {
             tracing::warn!(%error, "could not save the guided session");
         }
@@ -332,6 +448,7 @@ impl GuidedRecordingWindow {
                     })
                     .detach();
                 }
+                self.recorder.clock = None;
                 self.recorder.phase = Phase::Idle;
                 self.recorder.message = Some("Take discarded.".to_string());
             }
@@ -364,7 +481,22 @@ impl GuidedRecordingWindow {
         };
         let video = session.video_path.clone();
         let audio_video = video.clone();
-        let (start, end, until) = (section.start, section.end, section.duration());
+        let (start, until) = (section.start, section.duration());
+        let plan = SegmentPlan {
+            lead: 0.0,
+            length: take.duration,
+            source_start: section.start,
+            source_end: section.end,
+            timing: take.timing.clone(),
+        };
+        let slide_pace = if take.timing.is_empty() {
+            Pace::Linear {
+                file_time: start,
+                until,
+            }
+        } else {
+            Pace::Timed(take.timing.clone())
+        };
         self.stop_player(cx);
         self.recorder.phase = Phase::Loading;
         cx.notify();
@@ -379,12 +511,7 @@ impl GuidedRecordingWindow {
                         let audio = AudioData::from_file(&mic)?;
                         tracks.push((audio, mic_start - take.lead_secs));
                     }
-                    let rate = f64::from(AudioData::SAMPLE_RATE);
-                    if let Ok(audio) = AudioData::from_file_range(
-                        &audio_video,
-                        (start * rate) as usize,
-                        (end * rate) as usize,
-                    ) {
+                    if let Ok(Some(audio)) = guided_media::segment_audio(&audio_video, &plan) {
                         tracks.push((audio, 0.0));
                     }
                     let audio = guided_media::mix(tracks, take.duration);
@@ -403,14 +530,15 @@ impl GuidedRecordingWindow {
                             vec![
                                 PlayerVideo {
                                     path: video,
-                                    file_time: start,
-                                    until,
+                                    pace: slide_pace,
                                     max_width: PREVIEW_MAX_WIDTH,
                                 },
                                 PlayerVideo {
                                     path: camera,
-                                    file_time: camera_time,
-                                    until: HOLD_LIMIT_SECS,
+                                    pace: Pace::Linear {
+                                        file_time: camera_time,
+                                        until: HOLD_LIMIT_SECS,
+                                    },
                                     max_width: CAMERA_MAX_WIDTH,
                                 },
                             ],
@@ -705,6 +833,23 @@ impl GuidedRecordingWindow {
             Phase::Reviewing => self.recorder.player.as_ref().map(Player::elapsed),
             _ => None,
         };
+        let speed = self.slide_speed();
+        let live_clock = self
+            .recorder
+            .clock
+            .clone()
+            .filter(|_| matches!(self.recorder.phase, Phase::Rolling { .. }));
+        let waiting = live_clock.as_ref().is_some_and(|clock| clock.waiting());
+        let steps_left = live_clock.as_ref().map_or(0, |clock| {
+            let mut count = 0;
+            let mut after = clock.source();
+            while let Some(beat) = session.next_beat(current, after) {
+                count += 1;
+                after = beat;
+            }
+            count
+        });
+        let total_steps = session.beats_in(current);
 
         let preview = div()
             .relative()
@@ -751,8 +896,34 @@ impl GuidedRecordingWindow {
                         .child(count.to_string()),
                 )
             })
+            .when(waiting, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom(px(16.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px(px(14.))
+                                .py(px(6.))
+                                .rounded(px(8.))
+                                .bg(gpui::hsla(0., 0., 0., 0.7))
+                                .text_size(px(15.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(gpui::white())
+                                .child(format!(
+                                    "Press → for the next animation ({steps_left} left)"
+                                )),
+                        ),
+                )
+            })
             .when_some(elapsed, |this, elapsed| {
-                let over = elapsed > section.duration();
+                let over = live_clock
+                    .as_ref()
+                    .map_or(elapsed > section.duration(), |clock| clock.at_end());
                 this.child(
                     div()
                         .absolute()
@@ -769,10 +940,16 @@ impl GuidedRecordingWindow {
                         .text_size(px(12.))
                         .text_color(gpui::white())
                         .child(format!(
-                            "{:.1}s / slide {:.1}s{}",
+                            "{:.1}s · slide {:.0}%{}",
                             elapsed,
-                            section.duration(),
-                            if over { " · holding" } else { "" }
+                            live_clock.as_ref().map_or(speed, |clock| clock.rate()) * 100.0,
+                            if over {
+                                " · holding the last frame"
+                            } else if waiting {
+                                " · waiting"
+                            } else {
+                                ""
+                            }
                         )),
                 )
             });
@@ -886,28 +1063,6 @@ impl GuidedRecordingWindow {
             }))
             .child(div().flex_1())
             .child(
-                self.button("guided-slower", "−", ButtonVariant::Outline)
-                    .disabled(busy)
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.recorder.wpm = (this.recorder.wpm - WPM_STEP).max(MIN_WPM);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(Hsla::from(theme.gray_11))
-                    .child(format!("{:.0} wpm", self.recorder.wpm)),
-            )
-            .child(
-                self.button("guided-faster", "+", ButtonVariant::Outline)
-                    .disabled(busy)
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.recorder.wpm = (this.recorder.wpm + WPM_STEP).min(MAX_WPM);
-                        cx.notify();
-                    })),
-            )
-            .child(
                 self.button("guided-previous", "◀ Previous", ButtonVariant::Gray)
                     .disabled(busy || current == 0)
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -919,6 +1074,103 @@ impl GuidedRecordingWindow {
                     .disabled(busy || current + 1 >= total)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_section(current + 1, window, cx)
+                    })),
+            );
+
+        let speed_note = if self.recorder.speed.is_some() {
+            "set by hand"
+        } else if self.recorder.step_mode {
+            "normal speed in step mode"
+        } else if self.recorder.match_pace {
+            "fitted to your reading pace"
+        } else {
+            "normal speed"
+        };
+        let label = |text: String| {
+            div()
+                .text_size(px(12.))
+                .text_color(Hsla::from(theme.gray_11))
+                .child(text)
+        };
+        let pace = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(8.))
+            .px(px(16.))
+            .pt(px(10.))
+            .child(
+                self.button(
+                    "guided-step-mode",
+                    if self.recorder.step_mode {
+                        "✓ Step through animations"
+                    } else {
+                        "Step through animations"
+                    },
+                    if self.recorder.step_mode {
+                        ButtonVariant::Dark
+                    } else {
+                        ButtonVariant::Outline
+                    },
+                )
+                .disabled(busy)
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.recorder.step_mode = !this.recorder.step_mode;
+                    this.recorder.speed = None;
+                    cx.notify();
+                })),
+            )
+            .child(label(if self.recorder.finding_beats {
+                "finding the animations…".to_string()
+            } else {
+                format!("{total_steps} pauses here, → plays the next")
+            }))
+            .child(div().w(px(12.)))
+            .child(
+                self.button("guided-speed-down", "−", ButtonVariant::Outline)
+                    .disabled(busy && live_clock.is_none())
+                    .on_click(
+                        cx.listener(|this, _, _window, cx| this.change_speed(-SPEED_STEP, cx)),
+                    ),
+            )
+            .child(label(format!("Slide {:.0}%", speed * 100.0)))
+            .child(
+                self.button("guided-speed-up", "+", ButtonVariant::Outline)
+                    .disabled(busy && live_clock.is_none())
+                    .on_click(
+                        cx.listener(|this, _, _window, cx| this.change_speed(SPEED_STEP, cx)),
+                    ),
+            )
+            .child(label(format!("{speed_note} (↑ ↓)")))
+            .when(self.recorder.speed.is_some(), |this| {
+                this.child(
+                    self.button("guided-speed-reset", "Fit to pace", ButtonVariant::Outline)
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.recorder.speed = None;
+                            this.recorder.match_pace = true;
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                self.button("guided-slower", "−", ButtonVariant::Outline)
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.recorder.wpm = (this.recorder.wpm - WPM_STEP).max(MIN_WPM);
+                        this.recorder.speed = None;
+                        cx.notify();
+                    })),
+            )
+            .child(label(format!("{:.0} wpm", self.recorder.wpm)))
+            .child(
+                self.button("guided-faster", "+", ButtonVariant::Outline)
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.recorder.wpm = (this.recorder.wpm + WPM_STEP).min(MAX_WPM);
+                        this.recorder.speed = None;
+                        cx.notify();
                     })),
             );
 
@@ -949,6 +1201,7 @@ impl GuidedRecordingWindow {
                                     .child(message),
                             )
                         })
+                        .child(pace)
                         .child(controls),
                 ),
             )

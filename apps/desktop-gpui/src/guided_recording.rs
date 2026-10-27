@@ -19,6 +19,19 @@ const TIMED_SNAP_SECS: f64 = 1.5;
 /// How far a boundary estimated from word counts may move to reach a slide change.
 const ESTIMATED_SNAP_SECS: f64 = 6.0;
 const MIN_SECTION_SECS: f64 = 1.0;
+/// Frame-to-frame change (0-255 mean luma) above which an animation is moving.
+const BURST_MOTION: f32 = 0.15;
+/// ...and below which the slide is still.
+const CALM_MOTION: f32 = 0.08;
+/// Samples of stillness an animation has to follow to count as a new step.
+const CALM_SAMPLES: usize = 3;
+/// How soon after stirring an animation has to reach full motion.
+const BURST_LOOKAHEAD: usize = 3;
+/// Steps this close to a slide change are the slide's own entrance.
+const BEAT_CUT_GAP_SECS: f64 = 0.4;
+/// The slowest and fastest a slide is played to fit the reading pace.
+pub const MIN_SLIDE_RATE: f64 = 0.4;
+pub const MAX_SLIDE_RATE: f64 = 1.5;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScriptSection {
@@ -66,17 +79,67 @@ pub struct Take {
     pub lead_secs: f64,
     /// Seconds from the slide starting to the take being stopped.
     pub duration: f64,
+    /// How the slide moved during the take: `[seconds since the slide
+    /// started, source video time]` points, linear between them. Empty means
+    /// the slide played at normal speed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timing: Vec<[f64; 2]>,
+}
+
+/// The source time a timing shows `t` seconds after the slide started.
+pub fn timing_source(timing: &[[f64; 2]], t: f64) -> f64 {
+    let Some(first) = timing.first() else {
+        return t;
+    };
+    if t <= first[0] {
+        return first[1];
+    }
+    for pair in timing.windows(2) {
+        let ([t0, s0], [t1, s1]) = (pair[0], pair[1]);
+        if t <= t1 {
+            return if t1 > t0 {
+                s0 + (s1 - s0) * (t - t0) / (t1 - t0)
+            } else {
+                s1
+            };
+        }
+    }
+    timing.last().map_or(t, |last| last[1])
+}
+
+/// The first moment after the slide started that a timing reaches source
+/// time `source`, or `None` if it never does.
+pub fn timing_take(timing: &[[f64; 2]], source: f64) -> Option<f64> {
+    let first = timing.first()?;
+    if source <= first[1] {
+        return Some(first[0]);
+    }
+    timing.windows(2).find_map(|pair| {
+        let ([t0, s0], [t1, s1]) = (pair[0], pair[1]);
+        (source <= s1 && s1 > s0).then(|| t0 + (t1 - t0) * (source - s0) / (s1 - s0))
+    })
+}
+
+/// How fast to play a section's slide so it lasts as long as reading its
+/// script at `words_per_minute`.
+pub fn slide_rate(section: &GuidedSection, words_per_minute: f64) -> f64 {
+    let read = section.word_count() as f64 * 60.0 / words_per_minute.max(1.0);
+    if read <= 0.0 {
+        return 1.0;
+    }
+    (section.duration() / read).clamp(MIN_SLIDE_RATE, MAX_SLIDE_RATE)
 }
 
 /// Where one section's take sits in its built segment. Segment time 0 is the
 /// camera's first frame; the slide starts at `lead`, plays to its end and then
 /// holds its last frame until the take ends.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SegmentPlan {
     pub lead: f64,
     pub length: f64,
     pub source_start: f64,
     pub source_end: f64,
+    pub timing: Vec<[f64; 2]>,
 }
 
 impl SegmentPlan {
@@ -86,6 +149,7 @@ impl SegmentPlan {
             length: take.duration.max(0.0),
             source_start: section.start,
             source_end: section.end,
+            timing: take.timing.clone(),
         }
     }
 
@@ -95,7 +159,25 @@ impl SegmentPlan {
 
     /// The source video time shown at segment time `t`.
     pub fn source_time(&self, t: f64) -> f64 {
-        (self.source_start + (t - self.lead).max(0.0)).min(self.source_end)
+        let local = (t - self.lead).max(0.0);
+        let source = if self.timing.is_empty() {
+            self.source_start + local
+        } else {
+            timing_source(&self.timing, local)
+        };
+        source.clamp(self.source_start, self.source_end)
+    }
+
+    /// The segment time at which source time `source` is first shown, if the
+    /// take got that far.
+    pub fn segment_time(&self, source: f64) -> Option<f64> {
+        let local = if self.timing.is_empty() {
+            Some(source - self.source_start)
+        } else {
+            timing_take(&self.timing, source)
+        }?;
+        let t = self.lead + local.max(0.0);
+        (t <= self.total()).then_some(t)
     }
 }
 
@@ -135,9 +217,35 @@ pub struct GuidedSession {
     pub sections: Vec<GuidedSection>,
     #[serde(default)]
     pub cuts: Vec<f64>,
+    /// Where an animation starts after the slide has been still: the points
+    /// step mode pauses at.
+    #[serde(default)]
+    pub beats: Option<Vec<f64>>,
 }
 
 impl GuidedSession {
+    /// The step points inside section `index`, after `after`.
+    pub fn next_beat(&self, index: usize, after: f64) -> Option<f64> {
+        let section = self.sections.get(index)?;
+        self.beats
+            .as_deref()?
+            .iter()
+            .copied()
+            .find(|beat| *beat > after + 0.05 && *beat > section.start && *beat < section.end)
+    }
+
+    pub fn beats_in(&self, index: usize) -> usize {
+        let Some(section) = self.sections.get(index) else {
+            return 0;
+        };
+        self.beats.as_deref().map_or(0, |beats| {
+            beats
+                .iter()
+                .filter(|beat| **beat > section.start && **beat < section.end)
+                .count()
+        })
+    }
+
     pub fn directory(&self) -> PathBuf {
         sessions_dir().join(slug(&self.title))
     }
@@ -390,6 +498,39 @@ pub fn scene_cuts(times: &[f64], signatures: &[Vec<u8>]) -> Vec<SceneCut> {
     cuts
 }
 
+/// Where animations start after the slide has been still for a moment. The
+/// returned time is the last still sample, so pausing there shows the
+/// previous step finished and resuming plays the next one from its start.
+pub fn detect_beats(times: &[f64], signatures: &[Vec<u8>], cuts: &[f64]) -> Vec<f64> {
+    let count = times.len().min(signatures.len());
+    let motions: Vec<f32> = (1..count)
+        .map(|index| difference(&signatures[index - 1], &signatures[index]))
+        .collect();
+    let mut beats = Vec::new();
+    let mut calm = 0usize;
+    for (offset, &motion) in motions.iter().enumerate() {
+        let rising = motion >= CALM_MOTION
+            && motions[offset..(offset + BURST_LOOKAHEAD).min(motions.len())]
+                .iter()
+                .any(|later| *later >= BURST_MOTION);
+        if rising && calm >= CALM_SAMPLES {
+            let time = times[offset];
+            if !cuts
+                .iter()
+                .any(|cut| (cut - time).abs() < BEAT_CUT_GAP_SECS)
+            {
+                beats.push(time);
+            }
+        }
+        if motion < CALM_MOTION {
+            calm += 1;
+        } else {
+            calm = 0;
+        }
+    }
+    beats
+}
+
 fn difference(before: &[u8], after: &[u8]) -> f32 {
     let len = before.len().min(after.len()).max(1);
     let total: u64 = before
@@ -630,6 +771,8 @@ pub fn prepare_session(video_path: &Path, script_path: &Path) -> Result<GuidedSe
     let duration = samples.duration;
     let cuts = scene_cuts(&samples.times, &samples.signatures);
     let sections = plan_sections(&script, duration, &cuts);
+    let cut_times: Vec<f64> = cuts.iter().map(|cut| cut.time).collect();
+    let beats = detect_beats(&samples.times, &samples.signatures, &cut_times);
     let title = if title.is_empty() {
         video_path
             .file_stem()
@@ -644,8 +787,19 @@ pub fn prepare_session(video_path: &Path, script_path: &Path) -> Result<GuidedSe
         script_path: script_path.to_path_buf(),
         video_duration: duration,
         sections,
-        cuts: cuts.iter().map(|cut| cut.time).collect(),
+        cuts: cut_times,
+        beats: Some(beats),
     })
+}
+
+/// Finds the step points for a session saved before they were recorded.
+pub fn session_beats(session: &GuidedSession) -> Result<Vec<f64>, String> {
+    let samples = sample_video(&session.video_path)?;
+    Ok(detect_beats(
+        &samples.times,
+        &samples.signatures,
+        &session.cuts,
+    ))
 }
 
 #[cfg(test)]
@@ -798,6 +952,7 @@ Impressions fell 33% year on year.
                 &[],
             ),
             cuts: vec![12.0, 25.0],
+            beats: None,
         };
         session.move_boundary(1, 0.5);
         assert_eq!(session.sections[1].start, 1.0);
@@ -823,6 +978,7 @@ Impressions fell 33% year on year.
                 &[],
             ),
             cuts: Vec::new(),
+            beats: None,
         };
         assert!(!session.ready_to_build());
         assert!(session.next_take_path(1).ends_with("section-02-take-1.cap"));
@@ -830,6 +986,7 @@ Impressions fell 33% year on year.
             project_path: PathBuf::from("t"),
             lead_secs: 3.2,
             duration,
+            timing: Vec::new(),
         };
         session.add_take(0, take(9.0));
         session.add_take(0, take(11.0));
@@ -853,6 +1010,7 @@ Impressions fell 33% year on year.
             project_path: PathBuf::new(),
             lead_secs: 3.5,
             duration: 14.0,
+            timing: Vec::new(),
         };
         let plan = SegmentPlan::new(&sections[1], &take, 0.5);
         assert_eq!(plan.lead, 3.0);
@@ -860,6 +1018,76 @@ Impressions fell 33% year on year.
         assert_eq!(plan.source_time(1.0), 10.0);
         assert_eq!(plan.source_time(5.0), 12.0);
         assert_eq!(plan.source_time(16.0), 20.0);
+    }
+
+    #[test]
+    fn timing_maps_both_ways() {
+        let timing = [[0.0, 10.0], [2.0, 11.0], [5.0, 11.0], [6.0, 12.0]];
+        assert_eq!(timing_source(&timing, 1.0), 10.5);
+        assert_eq!(timing_source(&timing, 4.0), 11.0);
+        assert_eq!(timing_source(&timing, 5.5), 11.5);
+        assert_eq!(timing_source(&timing, 9.0), 12.0);
+        assert_eq!(timing_take(&timing, 10.5), Some(1.0));
+        assert_eq!(timing_take(&timing, 11.0), Some(2.0));
+        assert_eq!(timing_take(&timing, 11.5), Some(5.5));
+        assert_eq!(timing_take(&timing, 12.5), None);
+    }
+
+    #[test]
+    fn segment_plan_follows_the_take_timing() {
+        let sections = plan_sections(
+            &[section("A", Some(0.0), 5), section("B", Some(10.0), 5)],
+            20.0,
+            &[],
+        );
+        let take = Take {
+            project_path: PathBuf::new(),
+            lead_secs: 2.0,
+            duration: 8.0,
+            timing: vec![[0.0, 10.0], [2.0, 11.0], [5.0, 11.0], [8.0, 14.0]],
+        };
+        let plan = SegmentPlan::new(&sections[1], &take, 0.0);
+        assert_eq!(plan.source_time(1.0), 10.0);
+        assert_eq!(plan.source_time(5.0), 11.0);
+        assert_eq!(plan.source_time(10.0), 14.0);
+        assert_eq!(plan.segment_time(10.5), Some(3.0));
+        assert_eq!(plan.segment_time(12.0), Some(8.0));
+        assert_eq!(plan.segment_time(15.0), None);
+    }
+
+    #[test]
+    fn slide_rate_fits_the_read() {
+        let sections = plan_sections(
+            &[section("A", Some(0.0), 70), section("B", Some(15.0), 140)],
+            75.0,
+            &[],
+        );
+        assert_eq!(slide_rate(&sections[0], 140.0), 0.5);
+        assert_eq!(slide_rate(&sections[1], 140.0), 1.0);
+        assert_eq!(slide_rate(&sections[1], 280.0), MAX_SLIDE_RATE);
+        assert_eq!(slide_rate(&sections[0], 40.0), MIN_SLIDE_RATE);
+    }
+
+    #[test]
+    fn beats_need_stillness_before_motion() {
+        let motions = [
+            0.0, 0.0, 0.0, 0.0, 0.9, 0.5, 0.2, 0.1, 0.0, 0.2, 0.0, 0.0, 0.0, 0.0, 0.6, 0.0,
+        ];
+        let mut level = 0u8;
+        let mut signatures = vec![vec![0u8; 100]];
+        let mut times = vec![0.0];
+        for (index, motion) in motions.iter().enumerate() {
+            let mut next = vec![level; 100];
+            let changed = (motion * 100.0) as usize;
+            for pixel in next.iter_mut().take(changed) {
+                *pixel = level.wrapping_add(1);
+            }
+            level = next[0];
+            signatures.push(next);
+            times.push((index + 1) as f64 / 10.0);
+        }
+        assert_eq!(detect_beats(&times, &signatures, &[]), vec![0.4, 1.4]);
+        assert_eq!(detect_beats(&times, &signatures, &[0.5]), vec![1.4]);
     }
 
     #[test]
@@ -904,6 +1132,9 @@ Impressions fell 33% year on year.
             let session = prepare_session(Path::new(&video), Path::new(&script)).unwrap();
             println!("saved {}", session.save().unwrap().display());
         }
+        let cut_times: Vec<f64> = cuts.iter().map(|cut| cut.time).collect();
+        let beats = detect_beats(&times, &signatures, &cut_times);
+        println!("beats {beats:?}");
         let (_, sections) = parse_script(&std::fs::read_to_string(script).unwrap());
         for section in plan_sections(&sections, duration, &cuts) {
             println!(

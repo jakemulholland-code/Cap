@@ -15,7 +15,7 @@ use cap_audio::AudioData;
 use ffmpeg::format::{self as avformat, Pixel};
 use gpui::RenderImage;
 
-use crate::guided_recording::SegmentPlan;
+use crate::guided_recording::{SegmentPlan, timing_source};
 
 /// Decodes a video from a chosen time, converting each frame to one size and
 /// pixel format.
@@ -181,12 +181,171 @@ pub fn bgra_image(frame: &ffmpeg::frame::Video) -> Option<Arc<RenderImage>> {
     ])))
 }
 
-/// One picture in a playback: `file_time` is the file's time at playback 0,
-/// and after `until` seconds of playback the picture holds its last frame.
+/// The slide's own clock while a take records: it plays at a rate, can wait
+/// at a step point until told to go on, and holds at the section's end. Every
+/// change is kept as a timing point so the take can be rebuilt exactly.
+pub struct SlideClock {
+    started: Instant,
+    state: Mutex<ClockState>,
+}
+
+struct ClockState {
+    rate: f64,
+    playing: bool,
+    anchor: [f64; 2],
+    stop_at: f64,
+    end: f64,
+    points: Vec<[f64; 2]>,
+}
+
+impl ClockState {
+    fn advance(&mut self, now: f64) -> f64 {
+        if !self.playing {
+            return self.anchor[1];
+        }
+        let source = self.anchor[1] + (now - self.anchor[0]) * self.rate;
+        let limit = self.stop_at.min(self.end);
+        if source < limit {
+            return source;
+        }
+        let reached = self.anchor[0] + (limit - self.anchor[1]) / self.rate;
+        self.anchor = [reached, limit];
+        self.points.push(self.anchor);
+        self.playing = false;
+        limit
+    }
+
+    fn mark(&mut self, now: f64) -> f64 {
+        let source = self.advance(now);
+        self.anchor = [now, source];
+        self.points.push(self.anchor);
+        source
+    }
+}
+
+impl SlideClock {
+    /// A clock at `start` that plays at `rate` until `stop_at` (or `end`).
+    pub fn new(start: f64, end: f64, rate: f64, stop_at: Option<f64>) -> Arc<Self> {
+        Arc::new(Self {
+            started: Instant::now(),
+            state: Mutex::new(ClockState {
+                rate: rate.max(0.05),
+                playing: true,
+                anchor: [0.0, start],
+                stop_at: stop_at.unwrap_or(end),
+                end,
+                points: vec![[0.0, start]],
+            }),
+        })
+    }
+
+    pub fn elapsed(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+
+    pub fn source(&self) -> f64 {
+        self.source_at(self.elapsed())
+    }
+
+    fn source_at(&self, now: f64) -> f64 {
+        self.state
+            .lock()
+            .map_or(0.0, |mut state| state.advance(now))
+    }
+
+    pub fn rate(&self) -> f64 {
+        self.state.lock().map_or(1.0, |state| state.rate)
+    }
+
+    /// Waiting at a step point (not at the section's end).
+    pub fn waiting(&self) -> bool {
+        let now = self.elapsed();
+        self.state.lock().is_ok_and(|mut state| {
+            let source = state.advance(now);
+            !state.playing && source < state.end
+        })
+    }
+
+    pub fn at_end(&self) -> bool {
+        let now = self.elapsed();
+        self.state
+            .lock()
+            .is_ok_and(|mut state| state.advance(now) >= state.end)
+    }
+
+    /// Plays on from where the slide is until `stop_at` (or the end).
+    pub fn resume(&self, stop_at: Option<f64>) {
+        self.resume_at(self.elapsed(), stop_at);
+    }
+
+    fn resume_at(&self, now: f64, stop_at: Option<f64>) {
+        if let Ok(mut state) = self.state.lock() {
+            let source = state.mark(now);
+            if source < state.end {
+                state.playing = true;
+                state.stop_at = stop_at.unwrap_or(state.end);
+            }
+        }
+    }
+
+    pub fn set_rate(&self, rate: f64) {
+        self.set_rate_at(self.elapsed(), rate);
+    }
+
+    fn set_rate_at(&self, now: f64, rate: f64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.mark(now);
+            state.rate = rate.max(0.05);
+        }
+    }
+
+    /// The take's timing up to now; the clock keeps running.
+    pub fn timing(&self) -> Vec<[f64; 2]> {
+        self.timing_at(self.elapsed())
+    }
+
+    fn timing_at(&self, now: f64) -> Vec<[f64; 2]> {
+        self.state.lock().map_or_else(
+            |_| Vec::new(),
+            |mut state| {
+                state.mark(now);
+                state.points.clone()
+            },
+        )
+    }
+}
+
+/// How a picture in a playback moves.
+pub enum Pace {
+    /// `file_time` at playback 0, holding its last frame after `until` seconds.
+    Linear { file_time: f64, until: f64 },
+    /// A recorded take's timing.
+    Timed(Vec<[f64; 2]>),
+    /// Driven live by the recorder.
+    Live(Arc<SlideClock>),
+}
+
+impl Pace {
+    fn start(&self) -> f64 {
+        match self {
+            Pace::Linear { file_time, .. } => *file_time,
+            Pace::Timed(timing) => timing_source(timing, 0.0),
+            Pace::Live(clock) => clock.source(),
+        }
+    }
+
+    fn target(&self, elapsed: f64) -> Option<f64> {
+        match self {
+            Pace::Linear { file_time, until } => (elapsed <= *until).then_some(file_time + elapsed),
+            Pace::Timed(timing) => Some(timing_source(timing, elapsed)),
+            Pace::Live(clock) => Some(clock.source()),
+        }
+    }
+}
+
 pub struct PlayerVideo {
     pub path: PathBuf,
-    pub file_time: f64,
-    pub until: f64,
+    pub pace: Pace,
     pub max_width: u32,
 }
 
@@ -244,8 +403,8 @@ impl Drop for Player {
 
 struct Playing {
     reader: VideoReader,
-    file_time: f64,
-    until: f64,
+    pace: Pace,
+    exhausted: bool,
     pending: Option<(f64, ffmpeg::frame::Video)>,
 }
 
@@ -258,11 +417,11 @@ fn play(
     stop: &AtomicBool,
 ) {
     let mut readers: Vec<Option<Playing>> = videos
-        .iter()
+        .into_iter()
         .map(|video| {
             VideoReader::open(
                 &video.path,
-                video.file_time.max(0.0),
+                video.pace.start().max(0.0),
                 Pixel::BGRA,
                 Some(video.max_width),
             )
@@ -270,8 +429,8 @@ fn play(
             .ok()
             .map(|reader| Playing {
                 reader,
-                file_time: video.file_time,
-                until: video.until,
+                pace: video.pace,
+                exhausted: false,
                 pending: None,
             })
         })
@@ -296,17 +455,19 @@ fn play(
         for (index, slot) in readers.iter_mut().enumerate() {
             let Some(Playing {
                 reader,
-                file_time,
-                until,
+                pace,
+                exhausted,
                 pending,
             }) = slot
             else {
                 continue;
             };
-            if elapsed > *until {
+            if *exhausted {
                 continue;
             }
-            let target = *file_time + elapsed;
+            let Some(target) = pace.target(elapsed) else {
+                continue;
+            };
             let mut shown = None;
             loop {
                 let next = match pending.take() {
@@ -314,7 +475,7 @@ fn play(
                     None => reader.next().ok().flatten(),
                 };
                 let Some((time, frame)) = next else {
-                    *until = elapsed;
+                    *exhausted = true;
                     break;
                 };
                 if time > target {
@@ -407,28 +568,83 @@ pub fn write_segment_display(
 
 /// Writes the slide audio for one built segment as 16-bit WAV: silence for
 /// `plan.lead`, the section's audio, then silence to the end.
+/// A sound in the slide audio only starts above this level (dBFS, per 10 ms).
+const SOUND_FLOOR_DB: f32 = -55.0;
+/// Quieter gaps shorter than this stay part of the same sound.
+const SOUND_GAP_SECS: f64 = 0.25;
+const SOUND_WINDOW: usize = 480;
+
+/// The runs of sound in interleaved audio, as frame ranges.
+fn sound_events(samples: &[f32], channels: usize) -> Vec<(usize, usize)> {
+    let frames = samples.len() / channels.max(1);
+    let gap = (SOUND_GAP_SECS * f64::from(AudioData::SAMPLE_RATE)) as usize;
+    let floor = 10f32.powf(SOUND_FLOOR_DB / 20.0);
+    let mut events: Vec<(usize, usize)> = Vec::new();
+    let mut window = 0;
+    while window < frames {
+        let end = (window + SOUND_WINDOW).min(frames);
+        let chunk = &samples[window * channels..end * channels];
+        let rms = (chunk.iter().map(|sample| sample * sample).sum::<f32>()
+            / chunk.len().max(1) as f32)
+            .sqrt();
+        if rms >= floor {
+            match events.last_mut() {
+                Some(last) if window <= last.1 + gap => last.1 = end,
+                _ => events.push((window, end)),
+            }
+        }
+        window = end;
+    }
+    events
+}
+
+/// The slide audio laid out for a segment: silence for the lead, then each
+/// sound starting when its moment of the slide is shown, at normal speed, so
+/// slowing or pausing the slide never stretches a sound.
+pub fn segment_audio(source: &Path, plan: &SegmentPlan) -> Result<Option<AudioData>, String> {
+    let rate = f64::from(AudioData::SAMPLE_RATE);
+    let first = (plan.source_start * rate) as usize;
+    let last = (plan.source_end * rate) as usize;
+    let audio = match AudioData::from_file_range(source, first, last) {
+        Ok(audio) => audio,
+        Err(error) if error.contains("No Stream") => return Ok(None),
+        Err(error) => return Err(format!("Failed to read the video's audio: {error}")),
+    };
+    let channels = usize::from(audio.channels().max(1));
+    let available = audio.samples().len().min((last - first) * channels);
+    let source_samples = &audio.samples()[..available];
+    let mut samples = vec![0.0f32; (plan.total() * rate) as usize * channels];
+    for (start, end) in sound_events(source_samples, channels) {
+        let Some(at) = plan.segment_time(plan.source_start + start as f64 / rate) else {
+            continue;
+        };
+        let at = (at * rate) as usize * channels;
+        let sound = &source_samples[start * channels..end * channels];
+        for (offset, sample) in sound.iter().enumerate() {
+            let Some(slot) = samples.get_mut(at + offset) else {
+                break;
+            };
+            *slot += sample;
+        }
+    }
+    Ok(Some(AudioData::from_samples(samples, channels as u16)))
+}
+
+/// Writes [`segment_audio`] as 16-bit WAV. `false` when the video has no audio.
 pub fn write_segment_audio(
     source: &Path,
     plan: &SegmentPlan,
     output: &Path,
 ) -> Result<bool, String> {
-    let rate = AudioData::SAMPLE_RATE as f64;
-    let first = (plan.source_start * rate) as usize;
-    let last = (plan.source_end * rate) as usize;
-    let audio = match AudioData::from_file_range(source, first, last) {
-        Ok(audio) => audio,
-        Err(error) if error.contains("No Stream") => return Ok(false),
-        Err(error) => return Err(format!("Failed to read the video's audio: {error}")),
+    let Some(audio) = segment_audio(source, plan)? else {
+        return Ok(false);
     };
-    let channels = usize::from(audio.channels().max(1));
-    let lead = (plan.lead * rate) as usize * channels;
-    let total = (plan.total() * rate) as usize * channels;
-    let mut samples = vec![0.0f32; lead];
-    let take = (last - first) * channels;
-    samples.extend(audio.samples().iter().take(take));
-    samples.resize(total.max(samples.len()), 0.0);
-    samples.truncate(total);
-    write_wav(output, &samples, channels as u16, AudioData::SAMPLE_RATE)?;
+    write_wav(
+        output,
+        audio.samples(),
+        audio.channels(),
+        AudioData::SAMPLE_RATE,
+    )?;
     Ok(true)
 }
 
@@ -505,6 +721,41 @@ mod tests {
     }
 
     #[test]
+    fn slide_clock_records_rate_and_steps() {
+        let clock = SlideClock::new(10.0, 20.0, 0.5, Some(11.0));
+        assert_eq!(clock.source_at(1.0), 10.5);
+        assert_eq!(clock.source_at(3.0), 11.0);
+        clock.resume_at(4.0, Some(12.0));
+        assert_eq!(clock.source_at(5.0), 11.5);
+        clock.set_rate_at(5.0, 1.0);
+        assert_eq!(clock.source_at(5.5), 12.0);
+        clock.resume_at(7.0, None);
+        assert_eq!(clock.source_at(20.0), 20.0);
+        let timing = clock.timing_at(25.0);
+        assert_eq!(timing_source(&timing, 2.0), 11.0);
+        assert_eq!(timing_source(&timing, 3.5), 11.0);
+        assert_eq!(timing_source(&timing, 4.5), 11.25);
+        assert_eq!(timing_source(&timing, 6.0), 12.0);
+        assert_eq!(timing_source(&timing, 8.0), 13.0);
+        assert_eq!(timing_source(&timing, 24.0), 20.0);
+    }
+
+    #[test]
+    fn sounds_are_found_between_silences() {
+        let mut samples = vec![0.0f32; 48_000];
+        for sample in &mut samples[4_800..9_600] {
+            *sample = 0.5;
+        }
+        for sample in &mut samples[30_000..31_000] {
+            *sample = 0.5;
+        }
+        assert_eq!(
+            sound_events(&samples, 1),
+            vec![(4_800, 9_600), (29_760, 31_200)]
+        );
+    }
+
+    #[test]
     fn mix_offsets_and_widens_mono() {
         let mono = AudioData::from_samples(vec![0.5; 4], 1);
         let mixed = mix(vec![(mono, 2.0 / 48_000.0)], 6.0 / 48_000.0).unwrap();
@@ -532,6 +783,7 @@ mod real_tests {
             length: 20.0,
             source_start: 14.0,
             source_end: 30.0,
+            timing: Vec::new(),
         };
         let started = Instant::now();
         let fps = write_segment_display(&video, &plan, &dir.join("display.mp4")).unwrap();

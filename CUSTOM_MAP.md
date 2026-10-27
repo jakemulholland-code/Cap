@@ -55,12 +55,17 @@ are hints that drift. Read only the region you need from the big files.
   timestamps, fills missing ones by read time (`READ_WORDS_PER_MINUTE` 140), then snaps each start to the
   strongest cut within 1.5 s (6 s if estimated). `GuidedSession` (saved to `<app data>/guided/<slug>/session.json`,
   takes in `takes/section-NN-take-N.cap`), `move_boundary`, `neighbouring_cut`, `add_take`, `ready_to_build`.
-  `Take` (`lead_secs` = recording start to slide start, `duration`), `GuidedSection::chosen_take` (newest unless
-  picked). `SegmentPlan` (lead hold, slide, last-frame hold; `source_time`). `prepare_session`.
-- `apps/desktop-gpui/src/guided_media.rs`: `VideoReader` (decode from a time, convert/scale), `Player` (thread
-  playing pictures at wall-clock pace, optional rodio sound; holds a picture after its `until`),
-  `write_segment_display` (H.264 via `import::open_h264_encoder`), `write_segment_audio` (16-bit WAV),
-  `mix`. Ignored test `real_segment_render`.
+  `Take` (`lead_secs` = recording start to slide start, `duration`, `timing` = `[take secs, source secs]` points,
+  linear between; empty = normal speed), `GuidedSection::chosen_take` (newest unless picked). `timing_source` /
+  `timing_take` map both ways. `SegmentPlan` (lead hold, then the take's timing, clamped to the section;
+  `source_time`, `segment_time`). `slide_rate` fits a slide to the read at a wpm (0.4x-1.5x). `detect_beats` finds
+  step points (motion rising after 3 still samples; stored as `GuidedSession::beats`, `next_beat`,
+  `session_beats` fills old sessions). `prepare_session`.
+- `apps/desktop-gpui/src/guided_media.rs`: `VideoReader` (decode from a time, convert/scale), `SlideClock` (live
+  slide time: rate, wait at a step point, hold at the end, records timing points), `Pace` (Linear/Timed/Live),
+  `Player` (thread showing pictures by their `Pace`, optional rodio sound), `write_segment_display` (H.264 via
+  `import::open_h264_encoder`), `segment_audio` / `write_segment_audio` (the slide's sounds are found between
+  silences and each starts when its moment is shown, unstretched), `mix`. Ignored test `real_segment_render`.
 - `apps/desktop-gpui/src/guided_build.rs`: `build_project` writes `<recordings>/<title>.cap`: segment N =
   rendered slide `display.mp4` (start_time = camera start), copied take camera + mic (their own start_times),
   `system_audio.wav`; timeline clip N = [lead, lead + take]; config copied from the first take, then
@@ -70,7 +75,9 @@ are hints that drift. Read only the region you need from the big files.
 - `apps/desktop-gpui/src/guided_window/recorder.rs`: `Recorder`/`Phase`. Takes are `recording::start` with
   `ScreenCaptureTarget::CameraOnly` + the main window's camera/mic from `Feeds`, stopped with
   `ActiveRecording::stop`, cancelled with `cancel_and_delete`. 3 s countdown, then the slide plays and the
-  script scrolls at the wpm setting. Keys: Space record/stop, Esc cancel, arrows change section.
+  script scrolls at the wpm setting. The slide runs on a `SlideClock` at `slide_speed` (hand-picked, else fitted to
+  the wpm, normal in step mode); step mode waits at each beat. Keys: Space record/stop, Esc cancel, → next
+  animation while recording (next section when idle), ← previous section, ↑/↓ slide speed (live while recording).
 - Wiring: `app_windows::open_guided_recording` / `guided_recording_closed` (field `guided`, skipped in
   `own_windows`), `TrayItem::GuidedRecording`, `editor_clips::decode_thumbnail_frame` and import's H.264 helpers
   are `pub(crate)`. Harness: `CAP_GPUI_AUTO_TRAY=guided_recording`, `CAP_GPUI_AUTO_GUIDED=<session.json>[,record]`,
