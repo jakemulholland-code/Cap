@@ -75,9 +75,12 @@ are hints that drift. Read only the region you need from the big files.
 - `apps/desktop-gpui/src/guided_window/recorder.rs`: `Recorder`/`Phase`. Takes are `recording::start` with
   `ScreenCaptureTarget::CameraOnly` + the main window's camera/mic from `Feeds`, stopped with
   `ActiveRecording::stop`, cancelled with `cancel_and_delete`. 3 s countdown, then the slide plays and the
-  script scrolls at the wpm setting. The slide runs on a `SlideClock` at `slide_speed` (hand-picked, else fitted to
-  the wpm, normal in step mode); step mode waits at each beat. Keys: Space record/stop, Esc cancel, → next
-  animation while recording (next section when idle), ← previous section, ↑/↓ slide speed (live while recording).
+  script runs along a one-line bar at the top (`prompt_word` = word due at the wpm, highlighted; `follow_prompt`
+  eases it to `PROMPT_ANCHOR`). The slide runs on a `SlideClock` at `slide_speed` (hand-picked, else fitted to
+  the wpm, normal in step mode); step mode (on by default) waits at each beat, and `next_step` resumes or, mid
+  animation, moves `stop_point` on a beat. Keys (caught in `capture_key_down` on the window root, which refocuses
+  on every click because buttons take focus): Space record/stop, Esc cancel, → next animation while recording
+  (next section when idle), ← previous section, ↑/↓ slide speed (live while recording).
 - Wiring: `app_windows::open_guided_recording` / `guided_recording_closed` (field `guided`, skipped in
   `own_windows`), `TrayItem::GuidedRecording`, `editor_clips::decode_thumbnail_frame` and import's H.264 helpers
   are `pub(crate)`. Harness: `CAP_GPUI_AUTO_TRAY=guided_recording`, `CAP_GPUI_AUTO_GUIDED=<session.json>[,record]`,

@@ -22,11 +22,13 @@ use crate::recording::{self, ActiveRecording, RecordingMode, StartConfig};
 
 const COUNTDOWN_SECS: f64 = 3.0;
 const TICK: Duration = Duration::from_millis(16);
-const PREVIEW_HEIGHT: f32 = 300.;
 const PREVIEW_MAX_WIDTH: u32 = 960;
 const CAMERA_MAX_WIDTH: u32 = 480;
-const PROMPT_TEXT_SIZE: f32 = 30.;
-const PROMPT_TAIL: f32 = 220.;
+const PROMPT_TEXT_SIZE: f32 = 34.;
+const PROMPT_TAIL: f32 = 4000.;
+/// Where the word being read sits across the prompt bar.
+const PROMPT_ANCHOR: f32 = 0.3;
+const PROMPT_EASE: f32 = 0.2;
 const WPM_STEP: f64 = 10.0;
 const MIN_WPM: f64 = 80.0;
 const MAX_WPM: f64 = 220.0;
@@ -87,7 +89,7 @@ impl Default for Recorder {
             ticker: None,
             message: None,
             match_pace: true,
-            step_mode: false,
+            step_mode: true,
             speed: None,
             clock: None,
             finding_beats: false,
@@ -177,18 +179,28 @@ impl GuidedRecordingWindow {
         cx.notify();
     }
 
-    /// In step mode, plays the slide on to its next step point.
+    /// Plays the slide on through one more animation. Pressed while one is
+    /// still playing, the slide carries on through the next as well.
     fn next_step(&mut self, cx: &mut Context<Self>) {
         let Some(clock) = self.recorder.clock.clone() else {
             return;
         };
-        if !clock.waiting() {
+        let Some(end) = self.section().map(|section| section.end) else {
             return;
-        }
+        };
+        let after = if clock.waiting() {
+            clock.source()
+        } else {
+            match clock.stop_point() {
+                Some(stop) if stop < end => stop,
+                Some(_) => clock.source(),
+                None => return,
+            }
+        };
         let next = self
             .session
             .as_ref()
-            .and_then(|session| session.next_beat(self.recorder.current, clock.source()));
+            .and_then(|session| session.next_beat(self.recorder.current, after));
         clock.resume(next);
         cx.notify();
     }
@@ -646,19 +658,7 @@ impl GuidedRecordingWindow {
                     self.begin_rolling();
                 }
             }
-            Phase::Rolling { video_start } => {
-                let read = self
-                    .section()
-                    .map_or(1.0, |section| {
-                        section.word_count() as f64 * 60.0 / self.recorder.wpm
-                    })
-                    .max(1.0);
-                let fraction = (video_start.elapsed().as_secs_f64() / read).min(1.0) as f32;
-                let max = self.recorder.prompt.max_offset().y;
-                self.recorder
-                    .prompt
-                    .set_offset(gpui::point(px(0.), -(max * fraction)));
-            }
+            Phase::Rolling { .. } => self.follow_prompt(),
             Phase::Reviewing => {
                 if self
                     .recorder
@@ -680,6 +680,39 @@ impl GuidedRecordingWindow {
         }
         cx.notify();
         true
+    }
+
+    /// The word to be reading now, at the wpm setting.
+    fn prompt_word(&self) -> Option<usize> {
+        let words = self.section()?.word_count();
+        match self.recorder.phase {
+            Phase::Countdown { .. } => Some(0),
+            Phase::Rolling { video_start } => {
+                let read = video_start.elapsed().as_secs_f64() * self.recorder.wpm / 60.0;
+                Some((read as usize).min(words.saturating_sub(1)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Slides the prompt bar so the word being read sits at the anchor.
+    fn follow_prompt(&mut self) {
+        let prompt = &self.recorder.prompt;
+        let Some(word) = self
+            .prompt_word()
+            .and_then(|word| prompt.bounds_for_item(word))
+        else {
+            return;
+        };
+        let bar = prompt.bounds();
+        let target = (bar.size.width * PROMPT_ANCHOR - (word.left() - bar.left()))
+            .min(px(0.))
+            .max(-prompt.max_offset().x);
+        let offset = prompt.offset().x;
+        prompt.set_offset(gpui::point(
+            offset + (target - offset) * PROMPT_EASE,
+            px(0.),
+        ));
     }
 
     /// The player's newest pictures, handing the replaced ones back to the
@@ -853,8 +886,8 @@ impl GuidedRecordingWindow {
 
         let preview = div()
             .relative()
-            .flex_none()
-            .h(px(PREVIEW_HEIGHT))
+            .flex_1()
+            .min_h_0()
             .w_full()
             .bg(gpui::black())
             .when_some(slide, |this, image| {
@@ -954,38 +987,55 @@ impl GuidedRecordingWindow {
                 )
             });
 
+        let reading = self.prompt_word();
         let prompt = div()
             .id("guided-prompt")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
+            .flex_none()
+            .w_full()
+            .flex()
+            .items_center()
+            .overflow_x_scroll()
             .track_scroll(&self.recorder.prompt)
-            .px(px(32.))
-            .pt(px(20.))
-            .child(
-                div()
-                    .mb(px(8.))
-                    .text_size(px(12.))
-                    .text_color(Hsla::from(theme.gray_11))
-                    .child(format!(
-                        "{}. {} · {} words · about {:.0}s at {:.0} wpm",
-                        current + 1,
-                        section.title,
-                        section.word_count(),
-                        section.word_count() as f64 * 60.0 / self.recorder.wpm,
-                        self.recorder.wpm
-                    )),
+            .px(px(24.))
+            .py(px(14.))
+            .bg(gpui::hsla(0., 0., 0.08, 1.))
+            .text_size(px(PROMPT_TEXT_SIZE))
+            .line_height(px(PROMPT_TEXT_SIZE * 1.3))
+            .font_weight(FontWeight::MEDIUM)
+            .children(
+                section
+                    .text
+                    .split_whitespace()
+                    .enumerate()
+                    .map(|(index, word)| {
+                        let now = reading == Some(index);
+                        let said = reading.is_some_and(|reading| index < reading);
+                        div()
+                            .flex_none()
+                            .mr(px(10.))
+                            .px(px(6.))
+                            .rounded(px(6.))
+                            .text_color(if said {
+                                gpui::hsla(0., 0., 1., 0.35)
+                            } else {
+                                gpui::white()
+                            })
+                            .when(now, |this| {
+                                this.bg(Hsla::from(theme.blue_9))
+                                    .font_weight(FontWeight::BOLD)
+                            })
+                            .child(word.to_string())
+                    }),
             )
-            .children(section.text.split("\n\n").map(|paragraph| {
-                div()
-                    .mb(px(16.))
-                    .text_size(px(PROMPT_TEXT_SIZE))
-                    .line_height(px(PROMPT_TEXT_SIZE * 1.4))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(Hsla::from(theme.gray_12))
-                    .child(paragraph.to_string())
-            }))
-            .child(div().h(px(PROMPT_TAIL)));
+            .child(div().flex_none().w(px(PROMPT_TAIL)).h(px(1.)));
+        let prompt_info = format!(
+            "{}. {} · {} words · about {:.0}s at {:.0} wpm",
+            current + 1,
+            section.title,
+            section.word_count(),
+            section.word_count() as f64 * 60.0 / self.recorder.wpm,
+            self.recorder.wpm
+        );
 
         let record_label = match self.recorder.phase {
             Phase::Rolling { .. } => "■ Stop (Space)",
@@ -1181,6 +1231,7 @@ impl GuidedRecordingWindow {
             .flex_col()
             .flex_1()
             .min_h_0()
+            .child(prompt)
             .child(toolbar)
             .child(
                 div().flex().flex_1().min_h_0().child(list).child(
@@ -1190,7 +1241,14 @@ impl GuidedRecordingWindow {
                         .flex_1()
                         .min_w_0()
                         .child(preview)
-                        .child(prompt)
+                        .child(
+                            div()
+                                .px(px(16.))
+                                .pt(px(8.))
+                                .text_size(px(12.))
+                                .text_color(Hsla::from(theme.gray_11))
+                                .child(prompt_info),
+                        )
                         .when_some(message, |this, message| {
                             this.child(
                                 div()

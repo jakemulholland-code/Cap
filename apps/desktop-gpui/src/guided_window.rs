@@ -628,12 +628,16 @@ impl Render for GuidedRecordingWindow {
 
         let shell = div()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if matches!(this.stage, Stage::Record)
+                    && !event.keystroke.modifiers.modified()
                     && this.recorder_key(event.keystroke.key.as_str(), window, cx)
                 {
                     cx.stop_propagation();
                 }
+            }))
+            .capture_any_mouse_up(cx.listener(|this, _: &gpui::MouseUpEvent, window, cx| {
+                this.focus_root(window, cx);
             }))
             .size_full()
             .relative()

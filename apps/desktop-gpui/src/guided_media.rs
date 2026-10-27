@@ -266,6 +266,18 @@ impl SlideClock {
         })
     }
 
+    /// Where the slide will next stop, while it is playing.
+    pub fn stop_point(&self) -> Option<f64> {
+        self.stop_point_at(self.elapsed())
+    }
+
+    fn stop_point_at(&self, now: f64) -> Option<f64> {
+        self.state.lock().ok().and_then(|mut state| {
+            state.advance(now);
+            state.playing.then_some(state.stop_at.min(state.end))
+        })
+    }
+
     pub fn at_end(&self) -> bool {
         let now = self.elapsed();
         self.state
@@ -738,6 +750,18 @@ mod tests {
         assert_eq!(timing_source(&timing, 6.0), 12.0);
         assert_eq!(timing_source(&timing, 8.0), 13.0);
         assert_eq!(timing_source(&timing, 24.0), 20.0);
+    }
+
+    #[test]
+    fn slide_clock_moves_its_stop_while_playing() {
+        let clock = SlideClock::new(0.0, 10.0, 1.0, Some(2.0));
+        assert_eq!(clock.stop_point_at(1.0), Some(2.0));
+        clock.resume_at(1.0, Some(4.0));
+        assert_eq!(clock.source_at(3.0), 3.0);
+        assert_eq!(clock.source_at(5.0), 4.0);
+        assert_eq!(clock.stop_point_at(5.0), None);
+        let free = SlideClock::new(0.0, 10.0, 1.0, None);
+        assert_eq!(free.stop_point_at(1.0), Some(10.0));
     }
 
     #[test]
