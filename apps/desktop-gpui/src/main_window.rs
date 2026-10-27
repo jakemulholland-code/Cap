@@ -1740,17 +1740,53 @@ impl MainWindow {
         let Some(recording) = self.incomplete_recording.clone() else {
             return;
         };
-        if !recover
-            && !crate::platform::confirm_dialog(
-                "Cap",
-                tr::main::delete_recording_confirm(),
-                tr::common::yes(),
-                tr::common::no(),
-                false,
-            )
-        {
+        if !recover {
+            // The confirm is modal and pumps the platform's message loop (on
+            // Windows, `MessageBoxW`), which runs gpui's foreground tasks
+            // while it is up. Shown from inside this click's update, any task
+            // that wakes then panics on the already-borrowed app, so it runs
+            // from a spawned task with no borrow held (the `confirm_dialog`
+            // rule) and the action re-checks its state afterwards.
+            let project_path = recording.project_path;
+            cx.spawn_in(window, async move |this, cx| {
+                if !crate::platform::confirm_dialog(
+                    "Cap",
+                    tr::main::delete_recording_confirm(),
+                    tr::common::yes(),
+                    tr::common::no(),
+                    false,
+                ) {
+                    return;
+                }
+                this.update_in(cx, |this, window, cx| {
+                    if this
+                        .incomplete_recording
+                        .as_ref()
+                        .is_some_and(|current| current.project_path == project_path)
+                    {
+                        this.start_incomplete_recording_action(false, window, cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
             return;
         }
+        self.start_incomplete_recording_action(true, window, cx);
+    }
+
+    fn start_incomplete_recording_action(
+        &mut self,
+        recover: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.recovery_pending || self.session.read(cx).phase != Phase::Idle {
+            return;
+        }
+        let Some(recording) = self.incomplete_recording.clone() else {
+            return;
+        };
 
         self.recovery_pending = true;
         self.recovery_error = None;
