@@ -116,6 +116,28 @@ are hints that drift. Read only the region you need from the big files.
 - Fonts are installed per-user in `%LOCALAPPDATA%\Microsoft\Windows\Fonts` (Sora 300-700, Fraunces 600/700/900/700i).
   The source logo is at `../gmc-limit-checker/templates/_paramount_logo.svg`.
 
+### Studio Sound: DeepFilterNet 3 (RNNoise kept as "Classic")
+- Project setting: `cap_project::VoiceModel` (`DeepFilterNet` default | `RnNoise`), field
+  `AudioConfiguration::voice_model` in `crates/project/src/configuration.rs`.
+- `crates/audio/src/deep_filter.rs`: `DeepFilterStream` (`open(channels, frame)`, `process` = one hop of planar
+  samples in place, returns the local SNR in dB, `delay`). tract's state isn't `Send`, so one `deep-filter` worker
+  thread (`worker`/`serve`) owns the model, keeps one prototype per channel count and clones it per stream; enhancers
+  talk to it over channels (`Request::Open/Process/Close`). `load` checks hop == `FRAME` and the delay is whole frames,
+  else `open` returns `None` (warns once).
+- `crates/audio/src/voice.rs`: `VoiceDenoiser` (cap_audio's own enum, default `RnNoise`), private `Engine`
+  (`RnNoise(Vec<DenoiseState>)` | `DeepFilter`, `Engine::new` falls back to RNNoise when the stream won't open),
+  `VoiceEnhancer::with_denoiser` / `denoiser()` (the engine actually running). The delay line is sized from
+  `Engine::delay` (DeepFilterNet's three-frame lookahead), so `VOICE_WINDOW_PADDING_SAMPLES` is `FRAME * 10`.
+  Speech gate: `DEEP_FILTER_SPEECH_LSNR_DB` (6 dB) vs RNNoise's VAD > 0.6.
+- Wiring (`crates/editor`): `audio::voice_denoiser(VoiceModel)` maps project to engine; `voice_model` is part of the
+  `VoiceEnhancementCache` and `SpeedAudioProcessorKey` keys, `ExportAudioTrack` rebuilds on change, and
+  `preparing_audio/mixer.rs` passes it too.
+- UI: `"voice-model"` segmented control ("AI (DeepFilterNet)" / "Classic") in the Studio Sound card, `editor_tabs.rs`.
+- Build: `deep_filter` (git tag v0.5.6, `tract` + `default-model`) in `crates/audio/Cargo.toml`; root `Cargo.toml`
+  sets `opt-level = 2` in dev for `deep_filter` and the `tract-*` crates (unoptimised it can't keep up).
+- Probe: `cargo run -p cap-audio --example studio-sound-probe INPUT [strength] [rnnoise|deepfilternet]`.
+  The steady-tone refresh test in `audio_output/native_tests.rs` is pinned to RNNoise.
+
 ## Editor core (apps/desktop-gpui/src)
 
 `editor_window.rs` (~14k lines, `EditorWindow`):
